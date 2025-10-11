@@ -29,6 +29,7 @@ from copy import deepcopy
 from add_ckpt_path import add_path_to_dust3r
 import imageio.v2 as iio
 import roma
+from tqdm import tqdm
 
 # Set random seed for reproducibility.
 random.seed(42)
@@ -295,6 +296,13 @@ def prepare_output(
     from src.dust3r.utils.image import unpad_image
     from viser_utils import get_color
 
+    def _to_numpy(tensor_like):
+        if tensor_like is None:
+            return None
+        if isinstance(tensor_like, torch.Tensor):
+            return tensor_like.detach().cpu().numpy()
+        return tensor_like
+
     # Only keep the outputs corresponding to one full pass.
     valid_length = len(outputs["pred"]) // revisit
     outputs["pred"] = outputs["pred"][-valid_length:]
@@ -397,10 +405,16 @@ def prepare_output(
         
     if save_smpl:
         smpl_scores = [
-            output["smpl_scores"][...,0] for output in outputs["pred"]]
+            output["smpl_scores"][..., 0] for output in outputs["pred"]
+        ]
         if img_res is not None:
             smpl_scores = [
-                unpad_image(s, [H, W])[0] for s in smpl_scores]
+                unpad_image(s, [H, W])[0] for s in smpl_scores
+            ]
+        color_smpl_dir = os.path.join(outdir, "color_smpl")
+        smpl_param_dir = os.path.join(outdir, "smpl")
+        os.makedirs(color_smpl_dir, exist_ok=True)
+        os.makedirs(smpl_param_dir, exist_ok=True)
 
     has_mask = "msk" in outputs["pred"][0]
     if has_mask:
@@ -456,22 +470,33 @@ def prepare_output(
         if save_smpl:
             hm = vis_heatmap(colors_tosave[f_id], smpl_scores[f_id]).numpy()
             img_array_np = (color * 255).astype(np.uint8)
-            smpl_rend = render_meshes(img_array_np.copy(), pr_verts, pr_faces,
-                                        {'focal': intrins[[0,1],[0,1]], 
-                                        'princpt': intrins[[0,1],[-1,-1]]},
-                                        color=[get_color(i)/255 for i in smpl_id[f_id]])
+            smpl_rend = render_meshes(
+                img_array_np.copy(),
+                pr_verts,
+                pr_faces,
+                {'focal': intrins[[0, 1], [0, 1]], 'princpt': intrins[[0, 1], [-1, -1]]},
+                color=[get_color(i) / 255 for i in smpl_id[f_id]],
+            )
             if has_mask:
                 msk_array_np = vis_heatmap(colors_tosave[f_id], msks[f_id][0]).numpy()
-                color_smpl = np.concatenate([
-                    img_array_np, 
-                    (msk_array_np * 255).astype(np.uint8), 
-                    (hm * 255).astype(np.uint8), 
-                    smpl_rend], 1)
+                color_smpl = np.concatenate(
+                    [
+                        img_array_np,
+                        (msk_array_np * 255).astype(np.uint8),
+                        (hm * 255).astype(np.uint8),
+                        smpl_rend,
+                    ],
+                    1,
+                )
             else:
-                color_smpl = np.concatenate([
-                    img_array_np, 
-                    (hm * 255).astype(np.uint8), 
-                    smpl_rend], 1)
+                color_smpl = np.concatenate(
+                    [
+                        img_array_np,
+                        (hm * 255).astype(np.uint8),
+                        smpl_rend,
+                    ],
+                    1,
+                )
         
         # np.save(os.path.join(outdir, "depth", f"{f_id:06d}.npy"), depth)
         # np.save(os.path.join(outdir, "conf", f"{f_id:06d}.npy"), conf)
@@ -487,21 +512,22 @@ def prepare_output(
 
         # Save smpl results
         if save_smpl:
-            os.makedirs(os.path.join(outdir, "color_smpl"), exist_ok=True)
             iio.imwrite(
-                os.path.join(outdir, "color_smpl", f"{f_id:06d}.png"),
+                os.path.join(color_smpl_dir, f"{f_id:06d}.png"),
                 color_smpl,
             )
-            # os.makedirs(os.path.join(outdir, "smpl"), exist_ok=True)
-            # np.savez(
-            #     os.path.join(outdir, "smpl", f"{f_id:06d}.npz"),
-            #     scores=smpl_scores[f_id].numpy(),
-            #     msk=msks[f_id].numpy() if has_mask else None,
-            #     shape=smpl_shape[f_id].numpy(),
-            #     rotvec=smpl_rotvec[f_id].numpy(),
-            #     transl=smpl_transl[f_id].numpy(),
-            #     expression=smpl_expression[f_id].numpy() if smpl_expression[f_id] is not None else None
-            # )
+            np.savez(
+                os.path.join(smpl_param_dir, f"{f_id:06d}.npz"),
+                shape=_to_numpy(smpl_shape[f_id]),
+                rotvec=_to_numpy(smpl_rotvec[f_id]),
+                transl=_to_numpy(smpl_transl[f_id]),
+                expression=_to_numpy(smpl_expression[f_id]),
+                smpl_id=_to_numpy(smpl_id[f_id]),
+                scores=_to_numpy(smpl_scores[f_id]),
+                mask=_to_numpy(msks[f_id]) if has_mask else None,
+                cam2world=c2w,
+                intrinsics=intrins,
+            )
 
     if save_smpl and save_video:
         frames_dir = os.path.join(outdir, "color_smpl")
@@ -613,8 +639,26 @@ def run_inference(args):
     # Run inference.
     print("Running inference...")
     start_time = time.time()
-    outputs, _ = inference_recurrent_lighter(
-        views, model, device, use_ttt3r=args.use_ttt3r)
+
+    class _ProgressList(list):
+        """List wrapper that updates a tqdm bar each iteration."""
+
+        def __init__(self, data, progress_bar):
+            super().__init__(data)
+            self._progress_bar = progress_bar
+
+        def __iter__(self):
+            for item in super().__iter__():
+                self._progress_bar.update(1)
+                yield item
+
+    progress_bar = tqdm(total=len(views), desc="Inference", unit="frame")
+    try:
+        outputs, _ = inference_recurrent_lighter(
+            _ProgressList(views, progress_bar), model, device, use_ttt3r=args.use_ttt3r
+        )
+    finally:
+        progress_bar.close()
     total_time = time.time() - start_time
     per_frame_time = total_time / len(views)
     print(
