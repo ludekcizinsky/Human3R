@@ -3,10 +3,10 @@
 # Exit on error
 set -e
 
-seq_name="walking"
+seq_name="boxing"
 FRAMES_FOLDER="/scratch/izar/cizinsky/zurihack/human3r/$seq_name/color_smpl"
 OUTPUT_VIDEO="/scratch/izar/cizinsky/zurihack/human3r/$seq_name/${seq_name}_video.mp4"
-FPS="30"
+FPS="15"
 
 # Create parent directory for output if it doesn't exist
 mkdir -p "$(dirname "$OUTPUT_VIDEO")"

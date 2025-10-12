@@ -6,9 +6,9 @@ source /home/cizinsky/miniconda3/etc/profile.d/conda.sh
 conda activate human3r
 
 # Configurations
-SEQ_NAME="pushups"
+SEQ_NAME="boxing"
 INPUT_MOV="/home/cizinsky/zurihack/iphone_vids/$SEQ_NAME.mov"
-TARGET_FPS="15"
+TARGET_FPS="30"
 START_FRAME="0"
 END_FRAME="2000"
 
