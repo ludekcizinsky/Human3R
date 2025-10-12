@@ -6,7 +6,7 @@ source /home/cizinsky/miniconda3/etc/profile.d/conda.sh
 conda activate human3r
 
 # Configurations
-SEQ_NAME="boxes"
+SEQ_NAME="pushups"
 INPUT_MOV="/home/cizinsky/zurihack/iphone_vids/$SEQ_NAME.mov"
 TARGET_FPS="15"
 START_FRAME="0"
