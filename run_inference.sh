@@ -6,11 +6,11 @@ source /home/cizinsky/miniconda3/etc/profile.d/conda.sh
 conda activate human3r
 
 # Configurations
-SEQ_NAME="initial_demo"
+SEQ_NAME="boxes"
 INPUT_MOV="/home/cizinsky/zurihack/iphone_vids/$SEQ_NAME.mov"
-TARGET_FPS="30"
+TARGET_FPS="15"
 START_FRAME="0"
-END_FRAME="160"
+END_FRAME="2000"
 
 MODEL_PATH="/scratch/izar/cizinsky/pretrained/human3r.pth"
 SIZE=512
