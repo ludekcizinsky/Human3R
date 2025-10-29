@@ -19,7 +19,7 @@
 </h5>
 
 <div align="center">
-TL;DR: Inference with One model, One stage; Training in One day using One GPU
+TL;DR: Inference with One model, One stage; Training in One day using One GPU and this is a test
 </div>
 <br>
 
