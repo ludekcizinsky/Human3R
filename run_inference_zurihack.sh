@@ -6,16 +6,30 @@ source /home/cizinsky/miniconda3/etc/profile.d/conda.sh
 conda activate human3r
 
 # Configurations
-SCENE_NAME="football_high_res"
-SEQ_PATH="/scratch/izar/cizinsky/multiply-output/preprocessing/data/$SCENE_NAME/image"
+SEQ_NAME="boxing"
+INPUT_MOV="/home/cizinsky/zurihack/iphone_vids/$SEQ_NAME.mov"
+TARGET_FPS="30"
+START_FRAME="0"
+END_FRAME="2000"
+
 MODEL_PATH="/scratch/izar/cizinsky/pretrained/human3r.pth"
 SIZE=512
+SEQ_PATH="/home/cizinsky/zurihack/converted_mp4s/$SEQ_NAME.mp4"
 SUBSAMPLE=1
 VIS_THRESHOLD=2
 DOWNSAMPLE_FACTOR=1
 RESET_INTERVAL=100
-OUTPUT_DIR="/scratch/izar/cizinsky/multiply-output/preprocessing/data/$SCENE_NAME/human3r"
+OUTPUT_DIR="/scratch/izar/cizinsky/zurihack/human3r/$SEQ_NAME"
 mkdir -p $OUTPUT_DIR
+
+select_filter="select='between(n\\,$START_FRAME\\,$END_FRAME)'"
+
+echo "Converting $INPUT_MOV to $SEQ_PATH with fps=$TARGET_FPS from frame $START_FRAME to $END_FRAME"
+echo "---------------------------------------------------------------------------------------------"
+ffmpeg -y -i "$INPUT_MOV" \
+    -vf "$select_filter,fps=$TARGET_FPS" \
+    -vsync 0 \
+    "$SEQ_PATH"
 
 echo "Running inference"
 echo "---------------------------------------------------------------------------------------------"
