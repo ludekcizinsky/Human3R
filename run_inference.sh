@@ -6,15 +6,15 @@ source /home/cizinsky/miniconda3/etc/profile.d/conda.sh
 conda activate human3r
 
 # Configurations
-SCENE_NAME="football_high_res"
-SEQ_PATH="/scratch/izar/cizinsky/multiply-output/preprocessing/data/$SCENE_NAME/image"
+SCENE_NAME="taichi"
+SEQ_PATH="/scratch/izar/cizinsky/thesis/preprocessing/$SCENE_NAME/image"
 MODEL_PATH="/scratch/izar/cizinsky/pretrained/human3r.pth"
-SIZE=512
+SIZE=960
 SUBSAMPLE=1
 VIS_THRESHOLD=2
 DOWNSAMPLE_FACTOR=1
 RESET_INTERVAL=100
-OUTPUT_DIR="/scratch/izar/cizinsky/multiply-output/preprocessing/data/$SCENE_NAME/human3r"
+OUTPUT_DIR="/scratch/izar/cizinsky/thesis/preprocessing/$SCENE_NAME"
 mkdir -p $OUTPUT_DIR
 
 echo "Running inference"
