@@ -25,6 +25,7 @@ import cv2
 import argparse
 import tempfile
 import shutil
+import json
 import subprocess
 from copy import deepcopy
 from add_ckpt_path import add_path_to_dust3r
@@ -293,7 +294,7 @@ def prepare_output(
     from src.dust3r.utils.camera import pose_encoding_to_camera
     from src.dust3r.post_process import estimate_focal_knowing_depth
     from src.dust3r.utils.geometry import geotrf, matrix_cumprod
-    from src.dust3r.utils import SMPL_Layer, vis_heatmap, render_meshes
+    from src.dust3r.utils import SMPL_Layer, render_meshes
     from src.dust3r.utils.image import unpad_image
     from viser_utils import get_color
 
@@ -410,16 +411,7 @@ def prepare_output(
     # K_mhmr = [output.get(
     #     "K_mhmr", torch.empty(1,0,3))[0] for output in outputs["views"]]
         
-    if save_smpl:
-        smpl_scores = [
-            output["smpl_scores"][..., 0] for output in outputs["pred"]
-        ]
-        if img_res is not None:
-            smpl_scores = [
-                unpad_image(s, [H, W])[0] for s in smpl_scores
-            ]
-        color_smpl_dir = os.path.join(outdir, "color_smpl")
-        os.makedirs(color_smpl_dir, exist_ok=True)
+    per_person_state = {}
 
     has_mask = "msk" in outputs["pred"][0]
     if has_mask:
@@ -522,58 +514,94 @@ def prepare_output(
             pr_faces = []
             all_verts.append(torch.empty(0))
 
-        if save_smpl:
-            hm = vis_heatmap(colors_tosave[f_id], smpl_scores[f_id]).numpy()
+        if save_smpl and n_humans_i > 0:
             img_array_np = (color * 255).astype(np.uint8)
-            smpl_rend = render_meshes(
-                img_array_np.copy(),
-                pr_verts,
-                pr_faces,
-                {'focal': intrins[[0, 1], [0, 1]], 'princpt': intrins[[0, 1], [-1, -1]]},
-                color=[get_color(i) / 255 for i in smpl_id[f_id]],
-            )
-            color_smpl = np.concatenate(
-                [
-                    img_array_np,
-                    smpl_rend,
-                ],
-                1,
-            )
-    
-            iio.imwrite(
-                os.path.join(color_smpl_dir, f"{f_id:06d}.png"),
-                color_smpl,
-            )
+            intrins_dict = {
+                'focal': intrins[[0, 1], [0, 1]],
+                'princpt': intrins[[0, 1], [-1, -1]],
+            }
+            for h_idx in range(n_humans_i):
+                pid = int(person_ids[h_idx].item())
+                if pid not in per_person_state:
+                    person_root = os.path.join(outdir, f"{pid:02d}")
+                    param_dir = os.path.join(person_root, "smplx_params")
+                    frame_dir = os.path.join(person_root, "frames")
+                    os.makedirs(param_dir, exist_ok=True)
+                    os.makedirs(frame_dir, exist_ok=True)
+                    per_person_state[pid] = {
+                        "param_dir": param_dir,
+                        "frame_dir": frame_dir,
+                        "frame_counter": 0,
+                    }
+                state = per_person_state[pid]
 
-    if save_smpl:
-        frames_dir = color_smpl_dir
-        video_path = os.path.join(outdir, "output_video.mp4")
-        output_fps = 30 // subsample
+                params = {
+                    "betas": smpl_shape[f_id][h_idx].detach().cpu().numpy().tolist(),
+                    "root_pose": rotvec_world[h_idx, 0].detach().cpu().numpy().tolist(),
+                    "body_pose": rotvec_world[h_idx, 1:22].detach().cpu().numpy().tolist(),
+                    "jaw_pose": rotvec_world[h_idx, 52].detach().cpu().numpy().tolist(),
+                    "leye_pose": [0.0, 0.0, 0.0],
+                    "reye_pose": [0.0, 0.0, 0.0],
+                    "lhand_pose": rotvec_world[h_idx, 22:37].detach().cpu().numpy().tolist(),
+                    "rhand_pose": rotvec_world[h_idx, 37:52].detach().cpu().numpy().tolist(),
+                    "trans": transl_world[h_idx].detach().cpu().numpy().tolist(),
+                }
+                json_path = os.path.join(state["param_dir"], f"{frame_indices[f_id]:05d}.json")
+                with open(json_path, "w") as f:
+                    json.dump(params, f)
+
+                smpl_rend_single = render_meshes(
+                    img_array_np.copy(),
+                    [pr_verts[h_idx]],
+                    [smpl_faces],
+                    intrins_dict,
+                    color=[get_color(pid) / 255],
+                )
+                side_by_side = np.concatenate(
+                    [
+                        img_array_np,
+                        smpl_rend_single,
+                    ],
+                    1,
+                )
+                frame_seq_idx = state["frame_counter"]
+                state["frame_counter"] += 1
+                frame_path = os.path.join(state["frame_dir"], f"{frame_seq_idx:06d}.png")
+                iio.imwrite(frame_path, side_by_side)
+
+    if save_smpl and per_person_state:
         ffmpeg_bin = shutil.which("ffmpeg") or "ffmpeg"
-        ffmpeg_cmd = [
-            ffmpeg_bin,
-            "-y",
-            "-framerate",
-            str(output_fps),
-            "-i",
-            f"{frames_dir}/%06d.png",
-            "-vf",
-            "scale=trunc(iw/2)*2:trunc(ih/2)*2",
-            "-vcodec",
-            "h264",
-            "-preset",
-            "fast",
-            "-profile:v",
-            "baseline",
-            "-pix_fmt",
-            "yuv420p",
-            "-movflags",
-            "+faststart",
-            "-b:v",
-            "5000k",
-            video_path,
-        ]
-        subprocess.run(ffmpeg_cmd, check=True)
+        output_fps = max(1, 20 // subsample)
+        for pid, state in per_person_state.items():
+            if state["frame_counter"] == 0:
+                continue
+            frames_dir = state["frame_dir"]
+            video_path = os.path.join(os.path.dirname(frames_dir), "pose_visualized.mp4")
+            ffmpeg_cmd = [
+                ffmpeg_bin,
+                "-y",
+                "-framerate",
+                str(output_fps),
+                "-i",
+                f"{frames_dir}/%06d.png",
+                "-vf",
+                "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+                "-vcodec",
+                "h264",
+                "-preset",
+                "fast",
+                "-profile:v",
+                "baseline",
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+                "-b:v",
+                "5000k",
+                video_path,
+            ]
+            subprocess.run(ffmpeg_cmd, check=True)
+            shutil.rmtree(frames_dir, ignore_errors=True)
     R_w2c = R_c2w.permute(0, 2, 1)
     t_w2c = -torch.einsum("bij,bj->bi", R_w2c, t_c2w)
     cameras_to_save = {
@@ -582,34 +610,7 @@ def prepare_output(
         "t_world2cam": _to_numpy(t_w2c),
         "K": _to_numpy(intrinsics_tosave),
     }
-    smpl_export = None
-    if smpl_root_world:
-        smpl_export = {
-            "frame_idx": _to_numpy(torch.cat(smpl_frame_idx_world)),
-            "person_id": _to_numpy(torch.cat(smpl_person_id_world)),
-            "betas": _to_numpy(torch.cat(smpl_betas_world)),
-            "root_pose": _to_numpy(torch.cat(smpl_root_world)),
-            "body_pose": _to_numpy(torch.cat(smpl_body_world)),
-            "lhand_pose": _to_numpy(torch.cat(smpl_lhand_world)),
-            "rhand_pose": _to_numpy(torch.cat(smpl_rhand_world)),
-            "jaw_pose": _to_numpy(torch.cat(smpl_jaw_world)),
-            "trans": _to_numpy(torch.cat(smpl_trans_world)),
-        }
-        if smpl_expression_world:
-            smpl_export["expression"] = _to_numpy(torch.cat(smpl_expression_world))
-
-    return (
-        pts3ds_other,
-        colors, 
-        conf_other, 
-        cam_dict, 
-        all_verts, 
-        smpl_faces,
-        smpl_id,
-        msks,
-        cameras_to_save,
-        smpl_export
-    )
+    return cameras_to_save
 
 def parse_seq_path(p):
     if os.path.isdir(p):
@@ -668,6 +669,7 @@ def run_inference(args):
 
     # Prepare image file paths.
     img_paths, tmpdirname = parse_seq_path(args.seq_path)
+    # img_paths = img_paths[:5]
     if not img_paths:
         print(f"No images found in {args.seq_path}. Please verify the path.")
         return
@@ -731,30 +733,13 @@ def run_inference(args):
 
     # Process outputs for visualization.
     print("Preparing output for visualization...")
-    (
-        pts3ds_other, 
-        colors, 
-        conf, 
-        cam_dict, 
-        all_smpl_verts, 
-        smpl_faces,
-        smpl_id,
-        msks,
-        cameras_to_save,
-        smpl_export,
-        ) = prepare_output(
+    cameras_to_save = prepare_output(
         outputs, args.output_dir, 1, True, 
         args.save_smpl, args.save_video, img_res, args.subsample
     )
 
     cameras_path = os.path.join(args.output_dir, "cameras.npz")
     np.savez(cameras_path, **cameras_to_save)
-    if smpl_export is not None:
-        smplx_path = os.path.join(args.output_dir, "smplx_params.npz")
-        np.savez(smplx_path, **smpl_export)
-        print(f"Saved SMPL-X parameters to {smplx_path}")
-    else:
-        print("No SMPL-X parameters were produced; skipping SMPL-X save.")
     print(f"Saved camera parameters to {cameras_path}")
     print("Inference completed and artifacts saved.")
 
