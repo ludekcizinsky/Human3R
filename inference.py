@@ -435,16 +435,6 @@ def prepare_output(
     # os.makedirs(os.path.join(outdir, "camera"), exist_ok=True)
 
     all_verts = []
-    smpl_root_world = []
-    smpl_body_world = []
-    smpl_lhand_world = []
-    smpl_rhand_world = []
-    smpl_jaw_world = []
-    smpl_betas_world = []
-    smpl_trans_world = []
-    smpl_frame_idx_world = []
-    smpl_person_id_world = []
-    smpl_expression_world = []
     for f_id in range(B):
         n_humans_i = smpl_shape[f_id].shape[0]
         pr_pose_mat = pr_poses[f_id].squeeze(0)
@@ -472,27 +462,9 @@ def prepare_output(
             all_verts.append(geotrf(pr_poses[f_id], smpl_out['smpl_v3d'].unsqueeze(0))[0])
             pr_verts = [t.numpy() for t in smpl_out['smpl_v3d'].unbind(0)]
             pr_faces = [smpl_faces] * n_humans_i
-            rotvec_world = smpl_rotvec[f_id].detach().cpu().clone()
-            transl_world = smpl_transl[f_id].detach().cpu()
-            if rotvec_world.numel() > 0:
-                global_rotmat_cam = roma.rotvec_to_rotmat(rotvec_world[:, 0])
-                global_rotmat_world = torch.einsum(
-                    "ij,bjk->bik", R_c2w_f.cpu(), global_rotmat_cam
-                )
-                rotvec_world[:, 0] = roma.rotmat_to_rotvec(global_rotmat_world)
-            transl_world = torch.einsum(
-                "ij,bj->bi", R_c2w_f.cpu(), transl_world
-            ) + t_c2w_f.cpu()
-            smpl_root_world.append(rotvec_world[:, 0])
-            smpl_body_world.append(rotvec_world[:, 1:22])
-            smpl_lhand_world.append(rotvec_world[:, 22:37])
-            smpl_rhand_world.append(rotvec_world[:, 37:52])
-            smpl_jaw_world.append(rotvec_world[:, 52])
-            smpl_betas_world.append(smpl_shape[f_id].detach().cpu())
-            smpl_trans_world.append(transl_world)
-            smpl_frame_idx_world.append(
-                torch.full((n_humans_i,), frame_indices[f_id], dtype=torch.int32)
-            )
+            rotvec_cam = smpl_rotvec[f_id].detach().cpu().clone()
+            transl_cam = smpl_transl[f_id].detach().cpu()
+            transl_pelvis_cam = smpl_out["smpl_transl_pelvis"].detach().cpu()  # [n_h,1,3]
             raw_person_ids = smpl_id[f_id]
             if raw_person_ids is None:
                 person_ids = torch.arange(n_humans_i, dtype=torch.int32)
@@ -505,10 +477,6 @@ def prepare_output(
                         person_ids = torch.arange(n_humans_i, dtype=torch.int32)
                     else:
                         person_ids = person_ids.detach().cpu().to(torch.int32)
-            smpl_person_id_world.append(person_ids)
-            expr_f = smpl_expression[f_id]
-            if expr_f is not None and isinstance(expr_f, torch.Tensor) and expr_f.numel() > 0:
-                smpl_expression_world.append(expr_f.detach().cpu())
         else:
             pr_verts = []
             pr_faces = []
@@ -535,16 +503,26 @@ def prepare_output(
                     }
                 state = per_person_state[pid]
 
+                # Reorder to SMPL-X standard ordering (root, body, jaw, eyes, hands).
+                rot_reordered = torch.zeros((55, 3), dtype=torch.float32)
+                rot_reordered[0] = rotvec_cam[h_idx, 0]
+                rot_reordered[1:22] = rotvec_cam[h_idx, 1:22]
+                rot_reordered[22] = rotvec_cam[h_idx, 52]  # jaw
+                # eyes stay zero
+                rot_reordered[25:40] = rotvec_cam[h_idx, 22:37]  # left hand
+                rot_reordered[40:55] = rotvec_cam[h_idx, 37:52]  # right hand
+
                 params = {
                     "betas": smpl_shape[f_id][h_idx].detach().cpu().numpy().tolist(),
-                    "root_pose": rotvec_world[h_idx, 0].detach().cpu().numpy().tolist(),
-                    "body_pose": rotvec_world[h_idx, 1:22].detach().cpu().numpy().tolist(),
-                    "jaw_pose": rotvec_world[h_idx, 52].detach().cpu().numpy().tolist(),
+                    "root_pose": rot_reordered[0].numpy().tolist(),
+                    "body_pose": rot_reordered[1:22].numpy().tolist(),
+                    "jaw_pose": rot_reordered[22].numpy().tolist(),
                     "leye_pose": [0.0, 0.0, 0.0],
                     "reye_pose": [0.0, 0.0, 0.0],
-                    "lhand_pose": rotvec_world[h_idx, 22:37].detach().cpu().numpy().tolist(),
-                    "rhand_pose": rotvec_world[h_idx, 37:52].detach().cpu().numpy().tolist(),
-                    "trans": transl_world[h_idx].detach().cpu().numpy().tolist(),
+                    "lhand_pose": rot_reordered[25:40].numpy().tolist(),
+                    "rhand_pose": rot_reordered[40:55].numpy().tolist(),
+                    # pelvis translation in camera coordinates to match legacy outputs
+                    "trans": transl_pelvis_cam[h_idx, 0].numpy().tolist(),
                 }
                 json_path = os.path.join(state["param_dir"], f"{frame_indices[f_id]:05d}.json")
                 with open(json_path, "w") as f:
