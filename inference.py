@@ -141,6 +141,19 @@ def parse_args():
         default=10,
         help="Mask morphology for the viewer",
     )
+    parser.add_argument(
+        "--intrinsics_mode",
+        type=str,
+        choices=["estimate", "fov"],
+        default="estimate",
+        help="How to set intrinsics: estimate from depth (default) or fixed FOV like video2motion.",
+    )
+    parser.add_argument(
+        "--fov_deg",
+        type=float,
+        default=60.0,
+        help="FOV in degrees when using intrinsics_mode='fov'.",
+    )
     return parser.parse_args()
 
 
@@ -277,7 +290,8 @@ def prepare_input(
 
 def prepare_output(
         outputs, outdir, revisit=1, use_pose=True, 
-        save_smpl=False, save_video=False, img_res=None, subsample=1):
+        save_smpl=False, save_video=False, img_res=None, subsample=1,
+        intrinsics_mode="estimate", fov_deg=60.0):
     """
     Process inference outputs to generate point clouds and camera parameters for visualization.
 
@@ -293,7 +307,7 @@ def prepare_output(
     """
     from src.dust3r.utils.camera import pose_encoding_to_camera
     from src.dust3r.post_process import estimate_focal_knowing_depth
-    from src.dust3r.utils.geometry import geotrf, matrix_cumprod
+    from src.dust3r.utils.geometry import geotrf, matrix_cumprod, get_camera_parameters
     from src.dust3r.utils import SMPL_Layer, render_meshes
     from src.dust3r.utils.image import unpad_image
     from viser_utils import get_color
@@ -361,7 +375,30 @@ def prepare_output(
     # Estimate focal length based on depth.
     B, H, W, _ = pts3ds_self.shape
     pp = torch.tensor([W // 2, H // 2], device=pts3ds_self.device).float().repeat(B, 1)
-    focal = estimate_focal_knowing_depth(pts3ds_self, pp, focal_mode="weiszfeld")
+    if intrinsics_mode == "estimate":
+        focal = estimate_focal_knowing_depth(pts3ds_self, pp, focal_mode="weiszfeld")
+        intrinsics_tosave = (
+            torch.eye(3).unsqueeze(0).repeat(cam2world_tosave.shape[0], 1, 1)
+        )  # B, 3, 3
+        intrinsics_tosave[:, 0, 0] = focal.detach()
+        intrinsics_tosave[:, 1, 1] = focal.detach()
+        intrinsics_tosave[:, 0, 2] = pp[:, 0]
+        intrinsics_tosave[:, 1, 2] = pp[:, 1]
+    elif intrinsics_mode == "fov":
+        # mimic video2motion: fixed FOV with principal point at original image center
+        true_shapes = torch.stack([v["true_shape"] for v in outputs["views"]], dim=0)
+        if len(torch.unique(true_shapes, dim=0)) != 1:
+            raise NotImplementedError("Varying true_shape across views not supported for fov mode.")
+        orig_h, orig_w = true_shapes[0, 0].tolist()
+        max_side = max(orig_h, orig_w)
+        K_fov = get_camera_parameters(max_side, fov=fov_deg, device=pts3ds_self.device)
+        K_fov = K_fov.reshape(1, 3, 3).repeat(B, 1, 1)
+        K_fov[:, 0, 2] = orig_w / 2.0
+        K_fov[:, 1, 2] = orig_h / 2.0
+        intrinsics_tosave = K_fov.detach()
+        focal = K_fov[:, [0, 1], [0, 1]]
+    else:
+        raise ValueError(f"Unknown intrinsics_mode: {intrinsics_mode}")
 
     colors = [
         0.5 * (output["img"].permute(0, 2, 3, 1) + 1.0) for output in outputs["views"]
@@ -386,13 +423,6 @@ def prepare_output(
         ]
     )  # [B, H, W, 3]
     cam2world_tosave = torch.cat(pr_poses)  # B, 4, 4
-    intrinsics_tosave = (
-        torch.eye(3).unsqueeze(0).repeat(cam2world_tosave.shape[0], 1, 1)
-    )  # B, 3, 3
-    intrinsics_tosave[:, 0, 0] = focal.detach()
-    intrinsics_tosave[:, 1, 1] = focal.detach()
-    intrinsics_tosave[:, 0, 2] = pp[:, 0]
-    intrinsics_tosave[:, 1, 2] = pp[:, 1]
 
     # get SMPL parameters from outputs
     smpl_shape = [output.get(
@@ -713,7 +743,8 @@ def run_inference(args):
     print("Preparing output for visualization...")
     cameras_to_save = prepare_output(
         outputs, args.output_dir, 1, True, 
-        args.save_smpl, args.save_video, img_res, args.subsample
+        args.save_smpl, args.save_video, img_res, args.subsample,
+        intrinsics_mode=args.intrinsics_mode, fov_deg=args.fov_deg
     )
 
     cameras_path = os.path.join(args.output_dir, "cameras.npz")
