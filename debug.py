@@ -96,7 +96,7 @@ def prepare_motion_seqs_human3r(
     # Betas are frame-invariant; keep first frame only so shape is [Nv=1, beta_dim]
     if "betas" in smplx_params_tmp:
         # Frame-invariant shape params: squeeze frame dimension so betas shape is [beta_dim]
-        smplx_params_tmp["betas"] = smplx_params_tmp["betas"][:1].squeeze(0)
+        smplx_params_tmp["betas"] = smplx_params_tmp["betas"][6:7].squeeze(0)
     smplx_params = smplx_params_tmp
 
     # add batch dim
@@ -325,7 +325,7 @@ if __name__ == "__main__":
     # load frames
     frames_dir_path = "/scratch/izar/cizinsky/thesis/preprocessing/hi4d_pair19_piggyback/lhm/frames"
     frames_dir = Path(frames_dir_path)
-    frame_paths = sorted(frames_dir.glob("*.png"))[:1]
+    frame_paths = sorted(frames_dir.glob("*.png"))[6:7]
     frames = [load_img(fp, device) for fp in frame_paths]
     frames_tensor = torch.stack(frames, dim=0)
     print(f"Shape of frames tensor: {frames_tensor.shape} aned min {frames_tensor.min()} and max {frames_tensor.max()}")
@@ -360,7 +360,7 @@ if __name__ == "__main__":
         if k == "betas":
             firstx_smplx[k] = v  # [P, beta_dim]
         else:
-            firstx_smplx[k] = v[:, :1]  # [P, 1, ...]
+            firstx_smplx[k] = v[:, 6:7]  # [P, 1, ...]
 
     # Initial render
     overlay_init, masks_init = overlay_smplx_mesh_pyrender(frames_tensor, firstx_smplx, smplx_model, intrinsics, device)
@@ -368,7 +368,7 @@ if __name__ == "__main__":
 
     # Load corresponding ground truth mask
     mask_dir = Path("/scratch/izar/cizinsky/ait_datasets/full/hi4d/pair19_2/piggyback19/seg/img_seg_mask/4/all")
-    mask_paths = sorted(mask_dir.glob("*.png"))[:1]
+    mask_paths = sorted(mask_dir.glob("*.png"))[6:7]
     masks = [load_mask(mp, device) for mp in mask_paths]
     gt_mask = torch.stack(masks, dim=0)[0]
 

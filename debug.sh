@@ -7,4 +7,4 @@ conda activate human3r
 bash run_inference.sh
 
 conda activate lhm
-python debug.py --no-use_custom_smpl_layer
+python debug.py 
