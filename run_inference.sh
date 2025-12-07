@@ -1,8 +1,6 @@
 #!/bin/bash
 set -euo pipefail
 
-module load gcc ffmpeg
-
 source /home/cizinsky/miniconda3/etc/profile.d/conda.sh
 module load gcc ffmpeg
 
@@ -28,3 +26,4 @@ python inference.py \
     --use_ttt3r \
     --reset_interval "$RESET_INTERVAL" \
     --output_dir "$OUTPUT_DIR" \
+    # --max_frames 1

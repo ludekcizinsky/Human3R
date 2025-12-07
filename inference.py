@@ -388,9 +388,9 @@ def save_output(outputs, outdir, revisit=1, subsample=1):
                 smpl_rotvec[f_id], 
                 smpl_shape[f_id], 
                 smpl_transl[f_id], 
-                None, None, 
                 K=intrinsics_tosave[f_id].expand(n_humans_i, -1 , -1), 
-                expression=smpl_expression[f_id])
+                expression=smpl_expression[f_id]
+            )
 
         # Visualisation inputs
         # - Get the rgb image
@@ -453,6 +453,10 @@ def save_output(outputs, outdir, revisit=1, subsample=1):
             rot_reordered[40:55] = rotvec_cam[h_idx, 37:52]  # right hand
 
             # - Save to disk
+            #   Store both the raw translation given to SMPL Layer (camera frame, primary keypoint)
+            #   and the pelvis translation after the layer's internal offset for reference.
+            trans_cam = smpl_out["smpl_transl"][h_idx].detach().cpu().float().numpy().tolist()
+            trans_pelvis_cam_single = transl_pelvis_cam[h_idx, 0].detach().cpu().float().numpy().tolist()
             params = {
                 "betas": smpl_shape[f_id][h_idx].detach().cpu().numpy().tolist(),
                 "root_pose": rot_reordered[0].numpy().tolist(),
@@ -462,7 +466,10 @@ def save_output(outputs, outdir, revisit=1, subsample=1):
                 "reye_pose": [0.0, 0.0, 0.0],
                 "lhand_pose": rot_reordered[25:40].numpy().tolist(),
                 "rhand_pose": rot_reordered[40:55].numpy().tolist(),
-                "trans": transl_pelvis_cam[h_idx, 0].numpy().tolist(),
+                # translation expected by vanilla SMPL-X layer (camera frame, pelvis/root)
+                "trans": trans_cam,
+                # pelvis translation as produced by the custom SMPL_Layer (kept for reference/compat)
+                "trans_pelvis": trans_pelvis_cam_single,
             }
             json_path = os.path.join(state["param_dir"], f"{frame_indices[f_id]:05d}.json")
             with open(json_path, "w") as f:
@@ -552,7 +559,6 @@ def run_inference(args):
 
     # Prepare image file paths.
     img_paths, tmpdirname = parse_seq_path(args.seq_path)
-    # img_paths = img_paths[:10]
     if not img_paths:
         print(f"No images found in {args.seq_path}. Please verify the path.")
         return

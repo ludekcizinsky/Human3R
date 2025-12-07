@@ -40,27 +40,8 @@ class SMPL_Layer(nn.Module):
         if self.person_center is not None:
             self.person_center_idx = self.joint_names.index(self.person_center)
 
-    def forward(self,
-                pose, shape, transl,
-                loc, dist,
-                K,
-                expression=None, # facial expression
-                K_to_proj=None,
-                ):
-        """
-        Args:
-            - pose: pose of the person in axis-angle - torch.Tensor [bs,24,3]
-            - shape: torch.Tensor [bs,10]
-            - loc: 2D location of the pelvis in pixel space - torch.Tensor [bs,2]
-            - dist: distance of the pelvis from the camera in m - torch.Tensor [bs,1]
-        Return:
-            - dict containing a bunch of useful information about each person
-        """
-        
-        if loc is not None and dist is not None:
-            assert pose.shape[0] == shape.shape[0] == loc.shape[0] == dist.shape[0]
-            assert len(loc.shape) == 2 and list(loc.shape[1:]) == [2]
-            assert len(dist.shape) == 2 and list(dist.shape[1:]) == [1]
+    def forward(self, pose, shape, transl, K, expression=None):
+       
         if self.type == 'smpl':
             assert len(pose.shape) == 3 and list(pose.shape[1:]) == [24,3]
         elif self.type == 'smplx':
@@ -68,7 +49,7 @@ class SMPL_Layer(nn.Module):
         else:
             raise NameError
         assert len(shape.shape) == 2 and (list(shape.shape[1:]) == [self.num_betas] or list(shape.shape[1:]) == [self.num_betas+1])
-        assert (transl is not None) or (loc is not None and dist is not None)
+        assert transl is not None
 
         bs = pose.shape[0]
 
@@ -110,15 +91,6 @@ class SMPL_Layer(nn.Module):
         # Apply global orientation on 3D points - bis
         verts = (R.unsqueeze(1) @ (verts - pelvis).unsqueeze(-1)).squeeze(-1) # to pelvis-center coordinates: R(v-p)
 
-        # Location of the person in 3D
-        if transl is None:
-            if K.dtype == torch.float16:
-                # because of torch.inverse - not working with float16 at the moment
-                transl = inverse_perspective_projection(loc.unsqueeze(1).float(), K.float(), dist.unsqueeze(1).float())[:,0]    
-                transl = transl.half()
-            else:
-                transl = inverse_perspective_projection(loc.unsqueeze(1), K, dist.unsqueeze(1))[:,0] # head center in camera coordinates
-
         # Updating transl if we choose a certain person center
         transl_up = transl.clone()
 
@@ -136,11 +108,9 @@ class SMPL_Layer(nn.Module):
         j3d_cam = j3d + transl_up.unsqueeze(1) # move to camera coordinates
         verts_cam = verts + transl_up.unsqueeze(1)
 
-        if K_to_proj is None:
-            K_to_proj = K
         # Projection in camera plane
-        j2d = perspective_projection(j3d_cam, K_to_proj)
-        v2d = perspective_projection(verts_cam, K_to_proj)
+        j2d = perspective_projection(j3d_cam, K)
+        v2d = perspective_projection(verts_cam, K)
 
         out.update({
             'smpl_v3d': verts_cam, # in 3d camera space
