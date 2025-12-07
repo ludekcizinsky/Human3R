@@ -77,8 +77,6 @@ def prepare_motion_seqs_human3r(
             }
 
         smplx_param["expr"] = torch.FloatTensor([0.0] * 100)
-        if "trans_offset" not in smplx_param:
-            smplx_param["trans_offset"] = torch.zeros_like(smplx_param["trans"])
 
         bg_colors.append(bg_color)
         smplx_params.append(smplx_param)
@@ -163,17 +161,8 @@ def smplx_base_vertices_in_camera(
             except Exception:
                 expected_expr_dim = None
 
-        # We want the head joint to land at the raw translation predicted by the
-        # inference pipeline. With vanilla SMPL-X the global rotation is around
-        # the pelvis, so we solve for a pelvis translation that places the head
-        # at the desired camera coordinate.
-        transl_saved = smplx_params["trans"][pid : pid + 1, frame_idx]  # pelvis-based translation
-        trans_raw_all = smplx_params.get("trans_raw", None)
-        target_head_cam = (
-            trans_raw_all[pid : pid + 1, frame_idx] if trans_raw_all is not None else transl_saved
-        )
-
-        base_params = {
+        transl_use = smplx_params["transl"][pid : pid + 1, frame_idx]
+        params = {
             "global_orient": smplx_params["root_pose"][pid : pid + 1, frame_idx],
             "body_pose": smplx_params["body_pose"][pid : pid + 1, frame_idx],
             "jaw_pose": smplx_params["jaw_pose"][pid : pid + 1, frame_idx],
@@ -182,25 +171,12 @@ def smplx_base_vertices_in_camera(
             "left_hand_pose": smplx_params["lhand_pose"][pid : pid + 1, frame_idx],
             "right_hand_pose": smplx_params["rhand_pose"][pid : pid + 1, frame_idx],
             "betas": _pad_or_truncate(smplx_params["betas"][pid : pid + 1], expected_beta_dim, "betas"),
+            "transl": transl_use,
         }
         if "expr" in smplx_params:
             expr = smplx_params["expr"][pid : pid + 1, frame_idx]
-            base_params["expression"] = _pad_or_truncate(expr, expected_expr_dim, "expr")
-
-        # First pass with zero translation to measure head location after global_orient.
-        zero_params = dict(base_params)
-        zero_params["transl"] = torch.zeros_like(transl_saved)
-        zero_out = layer(**{k: v.to(device) for k, v in zero_params.items()})
-        head_idx = 15  # matches SMPL_Layer person_center="head"
-        head_offset = zero_out.joints[:, head_idx]  # [1,3] in camera frame with zero transl
-        target_head_cam = target_head_cam.to(head_offset.device)
-
-        # Solve for pelvis translation that sends head to target_head_cam.
-        solved_transl = target_head_cam - head_offset
-
-        solve_params = dict(base_params)
-        solve_params["transl"] = solved_transl
-        output = layer(**{k: v.to(device) for k, v in solve_params.items()})
+            params["expression"] = _pad_or_truncate(expr, expected_expr_dim, "expr")
+        output = layer(**{k: v.to(device) for k, v in params.items()})
         return output.vertices[0]
     except Exception as e:
         print(f"[DEBUG] Could not compute base SMPL-X verts in camera: {e}")

@@ -11,6 +11,7 @@ import shutil
 import json
 import subprocess
 from copy import deepcopy
+from typing import Optional
 from add_ckpt_path import add_path_to_dust3r
 import imageio.v2 as iio
 import roma
@@ -18,6 +19,40 @@ from tqdm import tqdm
 
 # Set random seed for reproducibility.
 random.seed(42)
+
+def solve_pelvis_translation_for_head(
+    bm_x,
+    rot_reordered_single: torch.Tensor,
+    betas_single: torch.Tensor,
+    expr_single: Optional[torch.Tensor],
+    target_head_cam: torch.Tensor,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Given a target head position in camera coordinates, solve the pelvis translation
+    that makes the vanilla SMPL-X head joint land at that position.
+    """
+    with torch.no_grad():
+        params = {
+            "betas": betas_single.unsqueeze(0).to(device),
+            "global_orient": rot_reordered_single[0:1].to(device),
+            "body_pose": rot_reordered_single[1:22].flatten().unsqueeze(0).to(device),
+            "left_hand_pose": rot_reordered_single[25:40].flatten().unsqueeze(0).to(device),
+            "right_hand_pose": rot_reordered_single[40:55].flatten().unsqueeze(0).to(device),
+            "jaw_pose": rot_reordered_single[22:23].flatten().unsqueeze(0).to(device),
+            "leye_pose": torch.zeros((1, 3), device=device),
+            "reye_pose": torch.zeros((1, 3), device=device),
+            "transl": torch.zeros((1, 3), device=device),
+        }
+        if expr_single is not None:
+            params["expression"] = expr_single.unsqueeze(0).to(device)
+        elif hasattr(bm_x, "expression"):
+            params["expression"] = bm_x.expression.repeat(1, 1).to(device)
+        head_idx = 15  # matches SMPL_Layer person_center='head'
+        zero_out = bm_x(**params)
+        head_offset = zero_out.joints[:, head_idx]  # [1,3]
+        solved_transl = target_head_cam.to(device) - head_offset
+        return solved_transl.squeeze(0).detach().cpu()
 
 class _ProgressList(list):
     """List wrapper that updates a tqdm bar each iteration."""
@@ -420,7 +455,6 @@ def save_output(outputs, outdir, revisit=1, subsample=1, orig_hw=None):
         # To be saved for later purposes
         # - Get the rotation vectors and pelvis translation in camera coordinates 
         rotvec_cam = smpl_rotvec[f_id].detach().cpu().clone()
-        transl_pelvis_cam = smpl_out["smpl_transl_pelvis"].detach().cpu()  # [n_h,1,3]
 
         # Parse person IDs
         raw_person_ids = smpl_id[f_id]
@@ -439,6 +473,7 @@ def save_output(outputs, outdir, revisit=1, subsample=1, orig_hw=None):
 
         for h_idx in range(n_humans_i):
             pid = int(person_ids[h_idx].item())
+            device_model = smpl_layer.bm_x.global_orient.device
 
             # Create directories for the current person if they don't exist
             if pid not in per_person_state:
@@ -463,12 +498,19 @@ def save_output(outputs, outdir, revisit=1, subsample=1, orig_hw=None):
             rot_reordered[25:40] = rotvec_cam[h_idx, 22:37]  # left hand
             rot_reordered[40:55] = rotvec_cam[h_idx, 37:52]  # right hand
 
+            # Solve pelvis translation so that vanilla SMPL-X head lands at the predicted head position.
+            expr_single = None if smpl_expression[f_id] is None else smpl_expression[f_id][h_idx]
+            target_head_cam = smpl_out["smpl_transl"][h_idx]
+            solved_transl = solve_pelvis_translation_for_head(
+                smpl_layer.bm_x,
+                rot_reordered,
+                smpl_shape[f_id][h_idx],
+                expr_single,
+                target_head_cam,
+                device_model,
+            )
+
             # - Save to disk
-            #   Store the pelvis translation expected by vanilla SMPL-X, plus the raw input for reference.
-            trans_pelvis_cam_single = transl_pelvis_cam[h_idx, 0].detach().cpu().float().numpy().tolist()
-            trans_cam_raw = smpl_out["smpl_transl"][h_idx].detach().cpu().float().numpy().tolist()
-            #   Offset from primary keypoint (head) to pelvis in camera frame.
-            trans_offset = (transl_pelvis_cam[h_idx, 0] - smpl_out["smpl_transl"][h_idx]).detach().cpu().float().numpy().tolist()
             params = {
                 "betas": smpl_shape[f_id][h_idx].detach().cpu().numpy().tolist(),
                 "root_pose": rot_reordered[0].numpy().tolist(),
@@ -478,12 +520,8 @@ def save_output(outputs, outdir, revisit=1, subsample=1, orig_hw=None):
                 "reye_pose": [0.0, 0.0, 0.0],
                 "lhand_pose": rot_reordered[25:40].numpy().tolist(),
                 "rhand_pose": rot_reordered[40:55].numpy().tolist(),
-                # translation expected by vanilla SMPL-X layer (camera frame, pelvis/root)
-                "trans": trans_pelvis_cam_single,
-                # offset from primary keypoint (head) to pelvis (camera frame)
-                "trans_offset": trans_offset,
-                # raw translation fed to SMPL_Layer before adding pelvis offset (for reference/debug)
-                "trans_raw": trans_cam_raw,
+                # translation saved for downstream use (camera frame, pelvis/root) already aligned to head
+                "transl": solved_transl.numpy().tolist(),
             }
             json_path = os.path.join(state["param_dir"], f"{frame_indices[f_id]:05d}.json")
             with open(json_path, "w") as f:

@@ -3,8 +3,8 @@
 source /home/cizinsky/miniconda3/etc/profile.d/conda.sh
 module load gcc ffmpeg
 
-# conda activate human3r
-# bash run_inference.sh
+conda activate human3r
+bash run_inference.sh
 
 conda activate lhm
-python debug.py
+python debug.py --no-use_custom_smpl_layer
