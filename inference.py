@@ -1,20 +1,3 @@
-#!/usr/bin/env python3
-"""
-Modified from CUT3R: https://github.com/CUT3R/CUT3R
-
-Online Human-Scene Reconstruction Inference and Visualization Script
-
-This script performs inference using the ARCroco3DStereo model and visualizes the
-resulting 3D scene point clouds and SMPLX sequences with the SceneHumanViewer. 
-Use the command-line arguments to adjust parameters 
-such as the model checkpoint path, image sequence directory, image size, device, etc.
-
-Example:
-    python demo.py --model_path src/human3r.pth --size 512 \
-        --seq_path examples/GoodMornin1.mp4 --subsample 1 --vis_threshold 2 \
-        --downsample_factor 1 --use_ttt3r --reset_interval 100
-"""
-
 import os
 import numpy as np
 import torch
@@ -36,6 +19,17 @@ from tqdm import tqdm
 # Set random seed for reproducibility.
 random.seed(42)
 
+class _ProgressList(list):
+    """List wrapper that updates a tqdm bar each iteration."""
+
+    def __init__(self, data, progress_bar):
+        super().__init__(data)
+        self._progress_bar = progress_bar
+
+    def __iter__(self):
+        for item in super().__iter__():
+            self._progress_bar.update(1)
+            yield item
 
 def parse_args():
     """Parse command-line arguments."""
@@ -67,32 +61,10 @@ def parse_args():
         help="Shape that input images will be rescaled to; if using 224+linear model, choose 224 otherwise 512",
     )
     parser.add_argument(
-        "--vis_threshold",
-        type=float,
-        default=1.5,
-        help="Visualization threshold for the viewer. Ranging from 1 to INF",
-    )
-    parser.add_argument(
-        "--msk_threshold",
-        type=float,
-        default=0.1,
-        help="Mask threshold. Ranging from 0 to 1",
-    )
-    parser.add_argument(
         "--output_dir",
         type=str,
         default="./tmp",
         help="value for tempfile.tempdir",
-    )
-    parser.add_argument(
-        "--save_smpl",
-        action="store_true",
-        help="Save smpl results.",
-    )
-    parser.add_argument(
-        "--save_video",
-        action="store_true",
-        help="Save smpl video.",
     )
     parser.add_argument(
         "--max_frames",
@@ -116,43 +88,6 @@ def parse_args():
         action="store_true",
         help="Use TTT3R.",
         default=False
-    )
-    parser.add_argument(
-        "--downsample_factor",
-        type=int,
-        default=10,
-        help="Point cloud downsample factor for the viewer",
-    )
-    parser.add_argument(
-        "--smpl_downsample",
-        type=int,
-        default=1,
-        help="SMPL sequence downsample factor for the viewer",
-    )
-    parser.add_argument(
-        "--camera_downsample",
-        type=int,
-        default=1,
-        help="Camera motion downsample factor for the viewer",
-    )
-    parser.add_argument(
-        "--mask_morph",
-        type=int,
-        default=10,
-        help="Mask morphology for the viewer",
-    )
-    parser.add_argument(
-        "--intrinsics_mode",
-        type=str,
-        choices=["estimate", "fov"],
-        default="estimate",
-        help="How to set intrinsics: estimate from depth (default) or fixed FOV like video2motion.",
-    )
-    parser.add_argument(
-        "--fov_deg",
-        type=float,
-        default=60.0,
-        help="FOV in degrees when using intrinsics_mode='fov'.",
     )
     return parser.parse_args()
 
@@ -288,338 +223,6 @@ def prepare_input(
 
     return views
 
-def prepare_output(
-        outputs, outdir, revisit=1, use_pose=True, 
-        save_smpl=False, save_video=False, img_res=None, subsample=1,
-        intrinsics_mode="estimate", fov_deg=60.0):
-    """
-    Process inference outputs to generate point clouds and camera parameters for visualization.
-
-    Args:
-        outputs (dict): Inference outputs.
-        revisit (int): Number of revisits per view.
-        use_pose (bool): Whether to transform points using camera pose.
-        save_smpl (bool): Whether to save smpl results.
-        save_video (bool): Whether to save smpl video.
-
-    Returns:
-        tuple: (points, colors, confidence, camera parameters dictionary)
-    """
-    from src.dust3r.utils.camera import pose_encoding_to_camera
-    from src.dust3r.post_process import estimate_focal_knowing_depth
-    from src.dust3r.utils.geometry import geotrf, matrix_cumprod, get_camera_parameters
-    from src.dust3r.utils import SMPL_Layer, render_meshes
-    from src.dust3r.utils.image import unpad_image
-    from viser_utils import get_color
-
-    def _to_numpy(tensor_like):
-        if tensor_like is None:
-            return None
-        if isinstance(tensor_like, torch.Tensor):
-            return tensor_like.detach().cpu().numpy()
-        return tensor_like
-
-    # Only keep the outputs corresponding to one full pass.
-    valid_length = len(outputs["pred"]) // revisit
-    outputs["pred"] = outputs["pred"][-valid_length:]
-    outputs["views"] = outputs["views"][-valid_length:]
-
-    # delet overlaps: reset_mask=True outputs["pred"] and outputs["views"]
-    reset_mask = torch.cat([view["reset"] for view in outputs["views"]], 0)
-    shifted_reset_mask = torch.cat([torch.tensor(False).unsqueeze(0), reset_mask[:-1]], dim=0)
-    outputs["pred"] = [
-        pred for pred, mask in zip(outputs["pred"], shifted_reset_mask) if not mask]
-    outputs["views"] = [
-        view for view, mask in zip(outputs["views"], shifted_reset_mask) if not mask]
-    reset_mask = reset_mask[~shifted_reset_mask]
-    frame_indices = []
-    for view in outputs["views"]:
-        idx = view["idx"]
-        if isinstance(idx, torch.Tensor):
-            idx = int(idx.item())
-        frame_indices.append(int(idx))
-
-    pts3ds_self_ls = [output["pts3d_in_self_view"] for output in outputs["pred"]]
-    pts3ds_other = [output["pts3d_in_other_view"] for output in outputs["pred"]]
-    conf_self = [output["conf_self"] for output in outputs["pred"]]
-    conf_other = [output["conf"] for output in outputs["pred"]]
-    pts3ds_self = torch.cat(pts3ds_self_ls, 0)
-
-    # Recover camera poses.
-    pr_poses = [
-        pose_encoding_to_camera(pred["camera_pose"].clone()).cpu()
-        for pred in outputs["pred"]
-    ]
-
-    # reset_mask = torch.cat([view["reset"] for view in outputs["views"]], 0)
-    if reset_mask.any():
-        pr_poses = torch.cat(pr_poses, 0)
-        identity = torch.eye(4, device=pr_poses.device)
-        reset_poses = torch.where(reset_mask.unsqueeze(-1).unsqueeze(-1), pr_poses, identity)
-        cumulative_bases = matrix_cumprod(reset_poses)
-        shifted_bases = torch.cat([identity.unsqueeze(0), cumulative_bases[:-1]], dim=0)
-        pr_poses = torch.einsum('bij,bjk->bik', shifted_bases, pr_poses)
-        # keeps only reset_mask=False pr_poses
-        pr_poses = list(pr_poses.unsqueeze(1).unbind(0))
-
-    R_c2w = torch.cat([pr_pose[:, :3, :3] for pr_pose in pr_poses], 0)
-    t_c2w = torch.cat([pr_pose[:, :3, 3] for pr_pose in pr_poses], 0)
-
-    if use_pose:
-        transformed_pts3ds_other = []
-        for pose, pself in zip(pr_poses, pts3ds_self):
-            transformed_pts3ds_other.append(geotrf(pose, pself.unsqueeze(0)))
-        pts3ds_other = transformed_pts3ds_other
-        conf_other = conf_self
-
-    # Estimate focal length based on depth.
-    B, H, W, _ = pts3ds_self.shape
-    pp = torch.tensor([W // 2, H // 2], device=pts3ds_self.device).float().repeat(B, 1)
-    if intrinsics_mode == "estimate":
-        focal = estimate_focal_knowing_depth(pts3ds_self, pp, focal_mode="weiszfeld")
-        intrinsics_tosave = (
-            torch.eye(3).unsqueeze(0).repeat(cam2world_tosave.shape[0], 1, 1)
-        )  # B, 3, 3
-        intrinsics_tosave[:, 0, 0] = focal.detach()
-        intrinsics_tosave[:, 1, 1] = focal.detach()
-        intrinsics_tosave[:, 0, 2] = pp[:, 0]
-        intrinsics_tosave[:, 1, 2] = pp[:, 1]
-    elif intrinsics_mode == "fov":
-        # mimic video2motion: fixed FOV with principal point at original image center
-        true_shapes = torch.stack([v["true_shape"] for v in outputs["views"]], dim=0)
-        if len(torch.unique(true_shapes, dim=0)) != 1:
-            raise NotImplementedError("Varying true_shape across views not supported for fov mode.")
-        orig_h, orig_w = true_shapes[0, 0].tolist()
-        max_side = max(orig_h, orig_w)
-        K_fov = get_camera_parameters(max_side, fov=fov_deg, device=pts3ds_self.device)
-        K_fov = K_fov.reshape(1, 3, 3).repeat(B, 1, 1)
-        K_fov[:, 0, 2] = orig_w / 2.0
-        K_fov[:, 1, 2] = orig_h / 2.0
-        intrinsics_tosave = K_fov.detach()
-        focal = K_fov[:, [0, 1], [0, 1]]
-    else:
-        raise ValueError(f"Unknown intrinsics_mode: {intrinsics_mode}")
-
-    colors = [
-        0.5 * (output["img"].permute(0, 2, 3, 1) + 1.0) for output in outputs["views"]
-    ]
-
-    cam_dict = {
-        "focal": focal.numpy(),
-        "pp": pp.numpy(),
-        "R": R_c2w.numpy(),
-        "t": t_c2w.numpy(),
-    }
-
-    pts3ds_self_tosave = pts3ds_self  # B, H, W, 3
-    depths_tosave = pts3ds_self_tosave[..., 2]
-    pts3ds_other_tosave = torch.cat(pts3ds_other)  # B, H, W, 3
-    conf_self_tosave = torch.cat(conf_self)  # B, H, W
-    conf_other_tosave = torch.cat(conf_other)  # B, H, W
-    colors_tosave = torch.cat(
-        [
-            0.5 * (output["img"].permute(0, 2, 3, 1) + 1.0)
-            for output in outputs["views"]
-        ]
-    )  # [B, H, W, 3]
-    cam2world_tosave = torch.cat(pr_poses)  # B, 4, 4
-
-    # get SMPL parameters from outputs
-    smpl_shape = [output.get(
-        "smpl_shape", torch.empty(1,0,10))[0] for output in outputs["pred"]]
-    smpl_rotvec = [roma.rotmat_to_rotvec(
-        output.get(
-            "smpl_rotmat", torch.empty(1,0,53,3,3))[0]) for output in outputs["pred"]]
-    smpl_transl = [output.get(
-        "smpl_transl", torch.empty(1,0,3))[0] for output in outputs["pred"]]
-    smpl_expression = [output.get(
-        "smpl_expression", [None])[0] for output in outputs["pred"]]
-    smpl_id = [output.get(
-        "smpl_id", torch.empty(1,0))[0] for output in outputs["pred"]]
-    # smpl_loc = [output.get(
-    #     "smpl_loc", torch.empty(1,0,2))[0] for output in outputs["pred"]]
-    # K_mhmr = [output.get(
-    #     "K_mhmr", torch.empty(1,0,3))[0] for output in outputs["views"]]
-        
-    per_person_state = {}
-
-    has_mask = "msk" in outputs["pred"][0]
-    if has_mask:
-        msks = [output["msk"][...,0] for output in outputs["pred"]]
-        if img_res is not None:
-            msks = [unpad_image(m, [H, W]) for m in msks]
-    else:
-        msks = [torch.zeros(1, H, W) for _ in range(B)]
-
-    # SMPL layer
-    smpl_layer = SMPL_Layer(type='smplx', 
-                            gender='neutral', 
-                            num_betas=smpl_shape[0].shape[-1], 
-                            kid=False, 
-                            person_center='head')
-    smpl_faces = smpl_layer.bm_x.faces
-
-    # os.makedirs(os.path.join(outdir, "depth"), exist_ok=True)
-    # os.makedirs(os.path.join(outdir, "conf"), exist_ok=True)
-    # os.makedirs(os.path.join(outdir, "color"), exist_ok=True)
-    # os.makedirs(os.path.join(outdir, "camera"), exist_ok=True)
-
-    all_verts = []
-    for f_id in range(B):
-        n_humans_i = smpl_shape[f_id].shape[0]
-        pr_pose_mat = pr_poses[f_id].squeeze(0)
-        R_c2w_f = pr_pose_mat[:3, :3]
-        t_c2w_f = pr_pose_mat[:3, 3]
-        
-        if n_humans_i > 0:
-            with torch.no_grad():
-                smpl_out = smpl_layer(
-                    smpl_rotvec[f_id], 
-                    smpl_shape[f_id], 
-                    smpl_transl[f_id], 
-                    None, None, 
-                    K=intrinsics_tosave[f_id].expand(n_humans_i, -1 , -1), 
-                    expression=smpl_expression[f_id])
-        
-        depth = depths_tosave[f_id].numpy()
-        conf = conf_self_tosave[f_id].numpy()
-        color = colors_tosave[f_id].numpy()
-        c2w = cam2world_tosave[f_id].numpy()
-        intrins = intrinsics_tosave[f_id].numpy()
-
-        if n_humans_i > 0:
-            # transform smpl verts to world coordinates
-            all_verts.append(geotrf(pr_poses[f_id], smpl_out['smpl_v3d'].unsqueeze(0))[0])
-            pr_verts = [t.numpy() for t in smpl_out['smpl_v3d'].unbind(0)]
-            pr_faces = [smpl_faces] * n_humans_i
-            rotvec_cam = smpl_rotvec[f_id].detach().cpu().clone()
-            transl_cam = smpl_transl[f_id].detach().cpu()
-            transl_pelvis_cam = smpl_out["smpl_transl_pelvis"].detach().cpu()  # [n_h,1,3]
-            raw_person_ids = smpl_id[f_id]
-            if raw_person_ids is None:
-                person_ids = torch.arange(n_humans_i, dtype=torch.int32)
-            else:
-                person_ids = raw_person_ids if isinstance(
-                    raw_person_ids, torch.Tensor
-                ) else torch.tensor(raw_person_ids)
-                if isinstance(person_ids, torch.Tensor):
-                    if person_ids.numel() == 0:
-                        person_ids = torch.arange(n_humans_i, dtype=torch.int32)
-                    else:
-                        person_ids = person_ids.detach().cpu().to(torch.int32)
-        else:
-            pr_verts = []
-            pr_faces = []
-            all_verts.append(torch.empty(0))
-
-        if save_smpl and n_humans_i > 0:
-            img_array_np = (color * 255).astype(np.uint8)
-            intrins_dict = {
-                'focal': intrins[[0, 1], [0, 1]],
-                'princpt': intrins[[0, 1], [-1, -1]],
-            }
-            for h_idx in range(n_humans_i):
-                pid = int(person_ids[h_idx].item())
-                if pid not in per_person_state:
-                    person_root = os.path.join(outdir, f"{pid:02d}")
-                    param_dir = os.path.join(person_root, "smplx_params")
-                    frame_dir = os.path.join(person_root, "frames")
-                    os.makedirs(param_dir, exist_ok=True)
-                    os.makedirs(frame_dir, exist_ok=True)
-                    per_person_state[pid] = {
-                        "param_dir": param_dir,
-                        "frame_dir": frame_dir,
-                        "frame_counter": 0,
-                    }
-                state = per_person_state[pid]
-
-                # Reorder to SMPL-X standard ordering (root, body, jaw, eyes, hands).
-                rot_reordered = torch.zeros((55, 3), dtype=torch.float32)
-                rot_reordered[0] = rotvec_cam[h_idx, 0]
-                rot_reordered[1:22] = rotvec_cam[h_idx, 1:22]
-                rot_reordered[22] = rotvec_cam[h_idx, 52]  # jaw
-                # eyes stay zero
-                rot_reordered[25:40] = rotvec_cam[h_idx, 22:37]  # left hand
-                rot_reordered[40:55] = rotvec_cam[h_idx, 37:52]  # right hand
-
-                params = {
-                    "betas": smpl_shape[f_id][h_idx].detach().cpu().numpy().tolist(),
-                    "root_pose": rot_reordered[0].numpy().tolist(),
-                    "body_pose": rot_reordered[1:22].numpy().tolist(),
-                    "jaw_pose": rot_reordered[22].numpy().tolist(),
-                    "leye_pose": [0.0, 0.0, 0.0],
-                    "reye_pose": [0.0, 0.0, 0.0],
-                    "lhand_pose": rot_reordered[25:40].numpy().tolist(),
-                    "rhand_pose": rot_reordered[40:55].numpy().tolist(),
-                    # pelvis translation in camera coordinates to match legacy outputs
-                    "trans": transl_pelvis_cam[h_idx, 0].numpy().tolist(),
-                }
-                json_path = os.path.join(state["param_dir"], f"{frame_indices[f_id]:05d}.json")
-                with open(json_path, "w") as f:
-                    json.dump(params, f)
-
-                smpl_rend_single = render_meshes(
-                    img_array_np.copy(),
-                    [pr_verts[h_idx]],
-                    [smpl_faces],
-                    intrins_dict,
-                    color=[get_color(pid) / 255],
-                )
-                side_by_side = np.concatenate(
-                    [
-                        img_array_np,
-                        smpl_rend_single,
-                    ],
-                    1,
-                )
-                frame_seq_idx = state["frame_counter"]
-                state["frame_counter"] += 1
-                frame_path = os.path.join(state["frame_dir"], f"{frame_seq_idx:06d}.png")
-                iio.imwrite(frame_path, side_by_side)
-
-    if save_smpl and per_person_state:
-        ffmpeg_bin = shutil.which("ffmpeg") or "ffmpeg"
-        output_fps = max(1, 20 // subsample)
-        for pid, state in per_person_state.items():
-            if state["frame_counter"] == 0:
-                continue
-            frames_dir = state["frame_dir"]
-            video_path = os.path.join(os.path.dirname(frames_dir), "pose_visualized.mp4")
-            ffmpeg_cmd = [
-                ffmpeg_bin,
-                "-y",
-                "-framerate",
-                str(output_fps),
-                "-i",
-                f"{frames_dir}/%06d.png",
-                "-vf",
-                "scale=trunc(iw/2)*2:trunc(ih/2)*2",
-                "-vcodec",
-                "h264",
-                "-preset",
-                "fast",
-                "-profile:v",
-                "baseline",
-                "-pix_fmt",
-                "yuv420p",
-                "-movflags",
-                "+faststart",
-                "-b:v",
-                "5000k",
-                video_path,
-            ]
-            subprocess.run(ffmpeg_cmd, check=True)
-            shutil.rmtree(frames_dir, ignore_errors=True)
-    R_w2c = R_c2w.permute(0, 2, 1)
-    t_w2c = -torch.einsum("bij,bj->bi", R_w2c, t_c2w)
-    cameras_to_save = {
-        "frame_idx": np.asarray(frame_indices, dtype=np.int32),
-        "R_world2cam": _to_numpy(R_w2c),
-        "t_world2cam": _to_numpy(t_w2c),
-        "K": _to_numpy(intrinsics_tosave),
-    }
-    return cameras_to_save
-
 def parse_seq_path(p):
     if os.path.isdir(p):
         img_paths = sorted(glob.glob(f"{p}/*"))
@@ -651,6 +254,269 @@ def parse_seq_path(p):
         cap.release()
     return img_paths, tmpdirname
 
+def _to_numpy(tensor_like):
+    if tensor_like is None:
+        return None
+    if isinstance(tensor_like, torch.Tensor):
+        return tensor_like.detach().cpu().numpy()
+    return tensor_like
+
+
+def save_output(outputs, outdir, revisit=1, subsample=1):
+
+    from src.dust3r.utils.camera import pose_encoding_to_camera
+    from src.dust3r.post_process import estimate_focal_knowing_depth
+    from src.dust3r.utils.geometry import geotrf, matrix_cumprod, get_camera_parameters
+    from src.dust3r.utils import SMPL_Layer, render_meshes
+    from src.dust3r.utils.image import unpad_image
+    from viser_utils import get_color
+
+    # Only keep the outputs corresponding to one full pass.
+    valid_length = len(outputs["pred"]) // revisit
+    outputs["pred"] = outputs["pred"][-valid_length:]
+    outputs["views"] = outputs["views"][-valid_length:]
+
+    # delet overlaps: reset_mask=True outputs["pred"] and outputs["views"]
+    reset_mask = torch.cat([view["reset"] for view in outputs["views"]], 0)
+    shifted_reset_mask = torch.cat([torch.tensor(False).unsqueeze(0), reset_mask[:-1]], dim=0)
+    outputs["pred"] = [
+        pred for pred, mask in zip(outputs["pred"], shifted_reset_mask) if not mask]
+    outputs["views"] = [
+        view for view, mask in zip(outputs["views"], shifted_reset_mask) if not mask]
+    reset_mask = reset_mask[~shifted_reset_mask]
+    frame_indices = []
+    for view in outputs["views"]:
+        idx = view["idx"]
+        if isinstance(idx, torch.Tensor):
+            idx = int(idx.item())
+        frame_indices.append(int(idx))
+
+    pts3ds_self_ls = [output["pts3d_in_self_view"] for output in outputs["pred"]]
+    pts3ds_self = torch.cat(pts3ds_self_ls, 0)
+
+
+    # Recover camera poses.
+    pr_poses = [
+        pose_encoding_to_camera(pred["camera_pose"].clone()).cpu()
+        for pred in outputs["pred"]
+    ]
+
+   # reset_mask = torch.cat([view["reset"] for view in outputs["views"]], 0)
+    if reset_mask.any():
+        pr_poses = torch.cat(pr_poses, 0)
+        identity = torch.eye(4, device=pr_poses.device)
+        reset_poses = torch.where(reset_mask.unsqueeze(-1).unsqueeze(-1), pr_poses, identity)
+        cumulative_bases = matrix_cumprod(reset_poses)
+        shifted_bases = torch.cat([identity.unsqueeze(0), cumulative_bases[:-1]], dim=0)
+        pr_poses = torch.einsum('bij,bjk->bik', shifted_bases, pr_poses)
+        # keeps only reset_mask=False pr_poses
+        pr_poses = list(pr_poses.unsqueeze(1).unbind(0))
+
+
+    R_c2w = torch.cat([pr_pose[:, :3, :3] for pr_pose in pr_poses], 0)
+    t_c2w = torch.cat([pr_pose[:, :3, 3] for pr_pose in pr_poses], 0)
+
+
+    # Estimate focal length based on depth.
+    B, H, W, _ = pts3ds_self.shape
+    pp = torch.tensor([W // 2, H // 2], device=pts3ds_self.device).float().repeat(B, 1)
+    focal = estimate_focal_knowing_depth(pts3ds_self, pp, focal_mode="weiszfeld")
+    intrinsics_tosave = (
+        torch.eye(3).unsqueeze(0).repeat(B, 1, 1)
+    )  # B, 3, 3
+    intrinsics_tosave[:, 0, 0] = focal.detach()
+    intrinsics_tosave[:, 1, 1] = focal.detach()
+    intrinsics_tosave[:, 0, 2] = pp[:, 0]
+    intrinsics_tosave[:, 1, 2] = pp[:, 1]
+
+
+    colors_tosave = torch.cat(
+        [
+            0.5 * (output["img"].permute(0, 2, 3, 1) + 1.0)
+            for output in outputs["views"]
+        ]
+    )  # [B, H, W, 3]
+
+
+    # get SMPL parameters from outputs
+    smpl_shape = [output.get(
+        "smpl_shape", torch.empty(1,0,10))[0] for output in outputs["pred"]]
+    smpl_rotvec = [roma.rotmat_to_rotvec(
+        output.get(
+            "smpl_rotmat", torch.empty(1,0,53,3,3))[0]) for output in outputs["pred"]]
+    smpl_transl = [output.get(
+        "smpl_transl", torch.empty(1,0,3))[0] for output in outputs["pred"]]
+    smpl_expression = [output.get(
+        "smpl_expression", [None])[0] for output in outputs["pred"]]
+    smpl_id = [output.get(
+        "smpl_id", torch.empty(1,0))[0] for output in outputs["pred"]]
+
+        
+    per_person_state = {}
+
+    # SMPL layer
+    smpl_layer = SMPL_Layer(type='smplx', 
+                            gender='neutral', 
+                            num_betas=smpl_shape[0].shape[-1], 
+                            kid=False, 
+                            person_center='head')
+    smpl_faces = smpl_layer.bm_x.faces
+
+
+    all_verts = []
+    for f_id in range(B):
+        n_humans_i = smpl_shape[f_id].shape[0]
+        pr_pose_mat = pr_poses[f_id].squeeze(0)
+        
+        if n_humans_i > 0:
+            with torch.no_grad():
+                smpl_out = smpl_layer(
+                    smpl_rotvec[f_id], 
+                    smpl_shape[f_id], 
+                    smpl_transl[f_id], 
+                    None, None, 
+                    K=intrinsics_tosave[f_id].expand(n_humans_i, -1 , -1), 
+                    expression=smpl_expression[f_id])
+        
+
+        color = colors_tosave[f_id].numpy()
+        intrins = intrinsics_tosave[f_id].numpy()
+
+        if n_humans_i > 0:
+            # transform smpl verts to world coordinates
+            all_verts.append(geotrf(pr_poses[f_id], smpl_out['smpl_v3d'].unsqueeze(0))[0])
+            pr_verts = [t.numpy() for t in smpl_out['smpl_v3d'].unbind(0)]
+            pr_faces = [smpl_faces] * n_humans_i
+            rotvec_cam = smpl_rotvec[f_id].detach().cpu().clone()
+            transl_cam = smpl_transl[f_id].detach().cpu()
+            transl_pelvis_cam = smpl_out["smpl_transl_pelvis"].detach().cpu()  # [n_h,1,3]
+            raw_person_ids = smpl_id[f_id]
+            if raw_person_ids is None:
+                person_ids = torch.arange(n_humans_i, dtype=torch.int32)
+            else:
+                person_ids = raw_person_ids if isinstance(
+                    raw_person_ids, torch.Tensor
+                ) else torch.tensor(raw_person_ids)
+                if isinstance(person_ids, torch.Tensor):
+                    if person_ids.numel() == 0:
+                        person_ids = torch.arange(n_humans_i, dtype=torch.int32)
+                    else:
+                        person_ids = person_ids.detach().cpu().to(torch.int32)
+        else:
+            pr_verts = []
+            pr_faces = []
+            all_verts.append(torch.empty(0))
+
+        img_array_np = (color * 255).astype(np.uint8)
+        intrins_dict = {
+            'focal': intrins[[0, 1], [0, 1]],
+            'princpt': intrins[[0, 1], [-1, -1]],
+        }
+        for h_idx in range(n_humans_i):
+            pid = int(person_ids[h_idx].item())
+            if pid not in per_person_state:
+                person_root = os.path.join(outdir, f"{pid:02d}")
+                param_dir = os.path.join(person_root, "smplx_params")
+                frame_dir = os.path.join(person_root, "frames")
+                os.makedirs(param_dir, exist_ok=True)
+                os.makedirs(frame_dir, exist_ok=True)
+                per_person_state[pid] = {
+                    "param_dir": param_dir,
+                    "frame_dir": frame_dir,
+                    "frame_counter": 0,
+                }
+            state = per_person_state[pid]
+
+            # Reorder to SMPL-X standard ordering (root, body, jaw, eyes, hands).
+            rot_reordered = torch.zeros((55, 3), dtype=torch.float32)
+            rot_reordered[0] = rotvec_cam[h_idx, 0]
+            rot_reordered[1:22] = rotvec_cam[h_idx, 1:22]
+            rot_reordered[22] = rotvec_cam[h_idx, 52]  # jaw
+            # eyes stay zero
+            rot_reordered[25:40] = rotvec_cam[h_idx, 22:37]  # left hand
+            rot_reordered[40:55] = rotvec_cam[h_idx, 37:52]  # right hand
+
+            params = {
+                "betas": smpl_shape[f_id][h_idx].detach().cpu().numpy().tolist(),
+                "root_pose": rot_reordered[0].numpy().tolist(),
+                "body_pose": rot_reordered[1:22].numpy().tolist(),
+                "jaw_pose": rot_reordered[22].numpy().tolist(),
+                "leye_pose": [0.0, 0.0, 0.0],
+                "reye_pose": [0.0, 0.0, 0.0],
+                "lhand_pose": rot_reordered[25:40].numpy().tolist(),
+                "rhand_pose": rot_reordered[40:55].numpy().tolist(),
+                # pelvis translation in camera coordinates to match legacy outputs
+                "trans": transl_pelvis_cam[h_idx, 0].numpy().tolist(),
+            }
+            json_path = os.path.join(state["param_dir"], f"{frame_indices[f_id]:05d}.json")
+            with open(json_path, "w") as f:
+                json.dump(params, f)
+
+            smpl_rend_single = render_meshes(
+                img_array_np.copy(),
+                [pr_verts[h_idx]],
+                [smpl_faces],
+                intrins_dict,
+                color=[get_color(pid) / 255],
+            )
+            side_by_side = np.concatenate(
+                [
+                    img_array_np,
+                    smpl_rend_single,
+                ],
+                1,
+            )
+            frame_seq_idx = state["frame_counter"]
+            state["frame_counter"] += 1
+            frame_path = os.path.join(state["frame_dir"], f"{frame_seq_idx:06d}.png")
+            iio.imwrite(frame_path, side_by_side)
+
+    ffmpeg_bin = shutil.which("ffmpeg") or "ffmpeg"
+    output_fps = max(1, 20 // subsample)
+    for pid, state in per_person_state.items():
+        if state["frame_counter"] == 0:
+            continue
+        frames_dir = state["frame_dir"]
+        video_path = os.path.join(os.path.dirname(frames_dir), "pose_visualized.mp4")
+        ffmpeg_cmd = [
+            ffmpeg_bin,
+            "-y",
+            "-framerate",
+            str(output_fps),
+            "-i",
+            f"{frames_dir}/%06d.png",
+            "-vf",
+            "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+            "-vcodec",
+            "h264",
+            "-preset",
+            "fast",
+            "-profile:v",
+            "baseline",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            "-b:v",
+            "5000k",
+            video_path,
+        ]
+        subprocess.run(ffmpeg_cmd, check=True)
+        shutil.rmtree(frames_dir, ignore_errors=True)
+    R_w2c = R_c2w.permute(0, 2, 1)
+    t_w2c = -torch.einsum("bij,bj->bi", R_w2c, t_c2w)
+    cameras_to_save = {
+        "frame_idx": np.asarray(frame_indices, dtype=np.int32),
+        "R_world2cam": _to_numpy(R_w2c),
+        "t_world2cam": _to_numpy(t_w2c),
+        "K": _to_numpy(intrinsics_tosave),
+    }
+
+    cameras_path = os.path.join(outdir, "cameras.npz")
+    np.savez(cameras_path, **cameras_to_save)
+
+    return cameras_to_save
+
 
 def run_inference(args):
     """
@@ -673,11 +539,10 @@ def run_inference(args):
     # Import model and inference functions after adding the ckpt path.
     from src.dust3r.inference import inference_recurrent_lighter
     from src.dust3r.model import ARCroco3DStereo
-    # Viewer removed; only saving outputs now.
 
     # Prepare image file paths.
     img_paths, tmpdirname = parse_seq_path(args.seq_path)
-    # img_paths = img_paths[:5]
+    # img_paths = img_paths[:10]
     if not img_paths:
         print(f"No images found in {args.seq_path}. Please verify the path.")
         return
@@ -714,18 +579,6 @@ def run_inference(args):
     print("Running inference...")
     start_time = time.time()
 
-    class _ProgressList(list):
-        """List wrapper that updates a tqdm bar each iteration."""
-
-        def __init__(self, data, progress_bar):
-            super().__init__(data)
-            self._progress_bar = progress_bar
-
-        def __iter__(self):
-            for item in super().__iter__():
-                self._progress_bar.update(1)
-                yield item
-
     progress_bar = tqdm(total=len(views), desc="Inference", unit="frame")
     try:
         outputs, _ = inference_recurrent_lighter(
@@ -740,29 +593,11 @@ def run_inference(args):
     )
 
     # Process outputs for visualization.
-    print("Preparing output for visualization...")
-    cameras_to_save = prepare_output(
-        outputs, args.output_dir, 1, True, 
-        args.save_smpl, args.save_video, img_res, args.subsample,
-        intrinsics_mode=args.intrinsics_mode, fov_deg=args.fov_deg
-    )
-
-    cameras_path = os.path.join(args.output_dir, "cameras.npz")
-    np.savez(cameras_path, **cameras_to_save)
-    print(f"Saved camera parameters to {cameras_path}")
-    print("Inference completed and artifacts saved.")
-
+    save_output(outputs, args.output_dir, 1, args.subsample)
 
 def main():
     args = parse_args()
-    if not args.seq_path:
-        print(
-            "No inputs found! Please use our gradio demo if you would like to iteractively upload inputs."
-        )
-        return
-    else:
-        run_inference(args)
-
+    run_inference(args)
 
 if __name__ == "__main__":
     main()

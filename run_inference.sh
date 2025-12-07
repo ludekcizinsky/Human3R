@@ -7,7 +7,7 @@ source /home/cizinsky/miniconda3/etc/profile.d/conda.sh
 module load gcc ffmpeg
 
 # Configurations
-SCENE_NAME="hi4d_pair00_fight"
+SCENE_NAME="hi4d_pair19_piggyback"
 BASE_DIR="/scratch/izar/cizinsky/thesis/preprocessing/$SCENE_NAME/lhm"
 SEQ_PATH="$BASE_DIR/frames"
 MODEL_PATH="/scratch/izar/cizinsky/pretrained/human3r_896L.pth"
@@ -16,8 +16,6 @@ mkdir -p "$OUTPUT_DIR"
 
 SIZE=512
 SUBSAMPLE=1
-VIS_THRESHOLD=2
-DOWNSAMPLE_FACTOR=1
 RESET_INTERVAL=100
 
 echo "Running initial reconstruction for scene: $SCENE_NAME"
@@ -28,9 +26,5 @@ python inference.py \
     --seq_path "$SEQ_PATH" \
     --subsample "$SUBSAMPLE" \
     --use_ttt3r \
-    --vis_threshold "$VIS_THRESHOLD" \
-    --downsample_factor "$DOWNSAMPLE_FACTOR" \
     --reset_interval "$RESET_INTERVAL" \
     --output_dir "$OUTPUT_DIR" \
-    --save_video \
-    --save_smpl --intrinsics_mode fov --fov_deg 60
