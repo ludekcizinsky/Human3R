@@ -161,7 +161,6 @@ def smplx_base_vertices_in_camera(
             except Exception:
                 expected_expr_dim = None
 
-        transl_use = smplx_params["transl"][pid : pid + 1, frame_idx]
         params = {
             "global_orient": smplx_params["root_pose"][pid : pid + 1, frame_idx],
             "body_pose": smplx_params["body_pose"][pid : pid + 1, frame_idx],
@@ -171,7 +170,7 @@ def smplx_base_vertices_in_camera(
             "left_hand_pose": smplx_params["lhand_pose"][pid : pid + 1, frame_idx],
             "right_hand_pose": smplx_params["rhand_pose"][pid : pid + 1, frame_idx],
             "betas": _pad_or_truncate(smplx_params["betas"][pid : pid + 1], expected_beta_dim, "betas"),
-            "transl": transl_use,
+            "transl": smplx_params["trans"][pid : pid + 1, frame_idx]
         }
         if "expr" in smplx_params:
             expr = smplx_params["expr"][pid : pid + 1, frame_idx]

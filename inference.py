@@ -521,7 +521,7 @@ def save_output(outputs, outdir, revisit=1, subsample=1, orig_hw=None):
                 "lhand_pose": rot_reordered[25:40].numpy().tolist(),
                 "rhand_pose": rot_reordered[40:55].numpy().tolist(),
                 # translation saved for downstream use (camera frame, pelvis/root) already aligned to head
-                "transl": solved_transl.numpy().tolist(),
+                "trans": solved_transl.numpy().tolist(),
             }
             json_path = os.path.join(state["param_dir"], f"{frame_indices[f_id]:05d}.json")
             with open(json_path, "w") as f:
