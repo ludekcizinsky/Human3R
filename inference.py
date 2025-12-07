@@ -467,6 +467,8 @@ def save_output(outputs, outdir, revisit=1, subsample=1, orig_hw=None):
             #   Store the pelvis translation expected by vanilla SMPL-X, plus the raw input for reference.
             trans_pelvis_cam_single = transl_pelvis_cam[h_idx, 0].detach().cpu().float().numpy().tolist()
             trans_cam_raw = smpl_out["smpl_transl"][h_idx].detach().cpu().float().numpy().tolist()
+            #   Offset from primary keypoint (head) to pelvis in camera frame.
+            trans_offset = (transl_pelvis_cam[h_idx, 0] - smpl_out["smpl_transl"][h_idx]).detach().cpu().float().numpy().tolist()
             params = {
                 "betas": smpl_shape[f_id][h_idx].detach().cpu().numpy().tolist(),
                 "root_pose": rot_reordered[0].numpy().tolist(),
@@ -478,6 +480,8 @@ def save_output(outputs, outdir, revisit=1, subsample=1, orig_hw=None):
                 "rhand_pose": rot_reordered[40:55].numpy().tolist(),
                 # translation expected by vanilla SMPL-X layer (camera frame, pelvis/root)
                 "trans": trans_pelvis_cam_single,
+                # offset from primary keypoint (head) to pelvis (camera frame)
+                "trans_offset": trans_offset,
                 # raw translation fed to SMPL_Layer before adding pelvis offset (for reference/debug)
                 "trans_raw": trans_cam_raw,
             }
