@@ -26,4 +26,4 @@ python inference.py \
     --use_ttt3r \
     --reset_interval "$RESET_INTERVAL" \
     --output_dir "$OUTPUT_DIR" \
-    # --max_frames 1
+    --max_frames 1

@@ -262,7 +262,7 @@ def _to_numpy(tensor_like):
     return tensor_like
 
 
-def save_output(outputs, outdir, revisit=1, subsample=1):
+def save_output(outputs, outdir, revisit=1, subsample=1, orig_hw=None):
 
     from src.dust3r.utils.camera import pose_encoding_to_camera
     from src.dust3r.post_process import estimate_focal_knowing_depth
@@ -323,15 +323,26 @@ def save_output(outputs, outdir, revisit=1, subsample=1):
     B, H, W, _ = pts3ds_self.shape
     pp = torch.tensor([W // 2, H // 2], device=pts3ds_self.device).float().repeat(B, 1)
     focal = estimate_focal_knowing_depth(pts3ds_self, pp, focal_mode="weiszfeld")
-    intrinsics_tosave = (
+    inf_res_intrinisics = (
         torch.eye(3).unsqueeze(0).repeat(B, 1, 1)
     )  # B, 3, 3
-    intrinsics_tosave[:, 0, 0] = focal.detach()
-    intrinsics_tosave[:, 1, 1] = focal.detach()
-    intrinsics_tosave[:, 0, 2] = pp[:, 0]
-    intrinsics_tosave[:, 1, 2] = pp[:, 1]
+    inf_res_intrinisics[:, 0, 0] = focal.detach()
+    inf_res_intrinisics[:, 1, 1] = focal.detach()
+    inf_res_intrinisics[:, 0, 2] = pp[:, 0]
+    inf_res_intrinisics[:, 1, 2] = pp[:, 1]
 
     # - save to disk
+    # If original image size is known, rescale intrinsics from model resolution to original resolution.
+    orig_h, orig_w = orig_hw
+    scale_x = orig_w / float(W)
+    scale_y = orig_h / float(H)
+    print(f"[DEBUG] save_output: model_hw=({H},{W}), orig_hw=({orig_h},{orig_w}), scale_x={scale_x:.4f}, scale_y={scale_y:.4f}")
+    intrinsics_tosave = inf_res_intrinisics.clone()
+    intrinsics_tosave[:, 0, 0] *= scale_x
+    intrinsics_tosave[:, 1, 1] *= scale_y
+    intrinsics_tosave[:, 0, 2] *= scale_x
+    intrinsics_tosave[:, 1, 2] *= scale_y
+
     cameras_to_save = {
         "frame_idx": np.asarray(frame_indices, dtype=np.int32),
         "R_world2cam": _to_numpy(R_w2c),
@@ -388,7 +399,7 @@ def save_output(outputs, outdir, revisit=1, subsample=1):
                 smpl_rotvec[f_id], 
                 smpl_shape[f_id], 
                 smpl_transl[f_id], 
-                K=intrinsics_tosave[f_id].expand(n_humans_i, -1 , -1), 
+                K=inf_res_intrinisics[f_id].expand(n_humans_i, -1 , -1), 
                 expression=smpl_expression[f_id]
             )
 
@@ -398,7 +409,7 @@ def save_output(outputs, outdir, revisit=1, subsample=1):
         img_array_np = (color * 255).astype(np.uint8)
 
         # - Get the intrinsic parameters for the current frame 
-        intrins = intrinsics_tosave[f_id].numpy()
+        intrins = inf_res_intrinisics[f_id].numpy()
         intrins_dict = {
             'focal': intrins[[0, 1], [0, 1]],
             'princpt': intrins[[0, 1], [-1, -1]],
@@ -453,10 +464,9 @@ def save_output(outputs, outdir, revisit=1, subsample=1):
             rot_reordered[40:55] = rotvec_cam[h_idx, 37:52]  # right hand
 
             # - Save to disk
-            #   Store both the raw translation given to SMPL Layer (camera frame, primary keypoint)
-            #   and the pelvis translation after the layer's internal offset for reference.
-            trans_cam = smpl_out["smpl_transl"][h_idx].detach().cpu().float().numpy().tolist()
+            #   Store the pelvis translation expected by vanilla SMPL-X, plus the raw input for reference.
             trans_pelvis_cam_single = transl_pelvis_cam[h_idx, 0].detach().cpu().float().numpy().tolist()
+            trans_cam_raw = smpl_out["smpl_transl"][h_idx].detach().cpu().float().numpy().tolist()
             params = {
                 "betas": smpl_shape[f_id][h_idx].detach().cpu().numpy().tolist(),
                 "root_pose": rot_reordered[0].numpy().tolist(),
@@ -467,9 +477,9 @@ def save_output(outputs, outdir, revisit=1, subsample=1):
                 "lhand_pose": rot_reordered[25:40].numpy().tolist(),
                 "rhand_pose": rot_reordered[40:55].numpy().tolist(),
                 # translation expected by vanilla SMPL-X layer (camera frame, pelvis/root)
-                "trans": trans_cam,
-                # pelvis translation as produced by the custom SMPL_Layer (kept for reference/compat)
-                "trans_pelvis": trans_pelvis_cam_single,
+                "trans": trans_pelvis_cam_single,
+                # raw translation fed to SMPL_Layer before adding pelvis offset (for reference/debug)
+                "trans_raw": trans_cam_raw,
             }
             json_path = os.path.join(state["param_dir"], f"{frame_indices[f_id]:05d}.json")
             with open(json_path, "w") as f:
@@ -609,7 +619,13 @@ def run_inference(args):
     )
 
     # Process outputs for visualization.
-    save_output(outputs, args.output_dir, 1, args.subsample)
+    # Original image size (H, W) for rescaling intrinsics back to the frame resolution.
+    first_img = cv2.imread(img_paths[0])
+    if first_img is None:
+        raise ValueError(f"Failed to read image at {img_paths[0]}")
+    orig_h, orig_w = first_img.shape[:2]
+
+    save_output(outputs, args.output_dir, 1, args.subsample, orig_hw=(orig_h, orig_w))
 
 def main():
     args = parse_args()

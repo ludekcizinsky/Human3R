@@ -99,6 +99,7 @@ class SMPL_Layer(nn.Module):
             # Add pelvis to transl - standard way for SMPLX layer
             transl_up = transl_up + pelvis[:,0] # back to smpl original coordinates
         else:
+            print(f"Centering around joint: {self.person_center} (index {self.person_center_idx})")
             # Center around the joint because teh translation is computed from this joint
             person_center = j3d[:, [self.person_center_idx]] # head center in pelvis-center coordinates
             verts = verts - person_center # nomalize to head-center coordinates

@@ -67,7 +67,6 @@ def prepare_motion_seqs_human3r(
 
     # load smplx params
     smplx_params, bg_colors = [], []
-    shape_param = None
 
     for idx, smplx_path in enumerate(motion_seqs):
         with open(smplx_path) as f:
@@ -77,9 +76,6 @@ def prepare_motion_seqs_human3r(
                 for k, v in smplx_raw_data.items()
                 if "pad_ratio" not in k
             }
-
-        if idx == 0:
-            shape_param = smplx_param["betas"]
 
         smplx_param["expr"] = torch.FloatTensor([0.0] * 100)
 
@@ -98,8 +94,11 @@ def prepare_motion_seqs_human3r(
             smplx_params_tmp[k].append(v)
     for k, v in smplx_params_tmp.items():
         smplx_params_tmp[k] = torch.stack(v)  # [Nv, xx, xx]
+    # Betas are frame-invariant; keep first frame only so shape is [Nv=1, beta_dim]
+    if "betas" in smplx_params_tmp:
+        # Frame-invariant shape params: squeeze frame dimension so betas shape is [beta_dim]
+        smplx_params_tmp["betas"] = smplx_params_tmp["betas"][:1].squeeze(0)
     smplx_params = smplx_params_tmp
-    smplx_params["betas"] = shape_param
 
     # add batch dim
     for k, v in smplx_params.items():
@@ -240,6 +239,7 @@ def overlay_smplx_mesh_pyrender(
             base_img = (images[fi].detach().cpu().numpy() * 255).astype(np.uint8)
             depth_map = np.ones((H, W)) * np.inf
             overlay_img = base_img.astype(np.float32)
+            frame_mask = torch.zeros((H, W, 1), device=images.device, dtype=images.dtype)
 
             for pid in range(num_people):
                 cam_verts = smplx_base_vertices_in_camera(
@@ -278,12 +278,13 @@ def overlay_smplx_mesh_pyrender(
                 depth_map[valid_mask] = rend_depth[valid_mask]
                 valid_mask = valid_mask[..., None]
                 overlay_img = valid_mask * color[..., :3] + (1.0 - valid_mask) * overlay_img
-                out_masks.append(torch.from_numpy(valid_mask).to(device=images.device, dtype=images.dtype))
+                frame_mask = torch.logical_or(frame_mask.bool(), torch.from_numpy(valid_mask).to(device=images.device)).to(images.dtype)
 
             overlay_tensor = (
                 torch.from_numpy(overlay_img).to(device=images.device, dtype=images.dtype) / 255.0
             )
             out_frames.append(overlay_tensor)
+            out_masks.append(frame_mask)
     finally:
         renderer.delete()
 
@@ -355,11 +356,16 @@ if __name__ == "__main__":
         all_smplx_params = torch.cat([m["smplx_params"][k] for m in motion_params_per_person], dim=0)
         joined_smplx_params[k] = all_smplx_params
 
-    firstx_smplx = {k: v[:, :1] for k, v in joined_smplx_params.items()}
+    firstx_smplx = {}
+    for k, v in joined_smplx_params.items():
+        if k == "betas":
+            firstx_smplx[k] = v  # [P, beta_dim]
+        else:
+            firstx_smplx[k] = v[:, :1]  # [P, 1, ...]
 
-    # Compute the rendered mask
-    result = overlay_smplx_mesh_pyrender(frames_tensor, firstx_smplx, smplx_model, intrinsics, device)
-    _, rendered_mask = result[0][0], result[1][0]
+    # Initial render
+    overlay_init, masks_init = overlay_smplx_mesh_pyrender(frames_tensor, firstx_smplx, smplx_model, intrinsics, device)
+    rendered_mask = masks_init[0]
 
     # Load corresponding ground truth mask
     mask_dir = Path("/scratch/izar/cizinsky/ait_datasets/full/hi4d/pair19_2/piggyback19/seg/img_seg_mask/4/all")
@@ -378,10 +384,7 @@ if __name__ == "__main__":
     out_file = Path(out_path) / f"rendered_smplx_mask.png"
     overlay = rendered_mask*0.5 + gt_mask*0.5
     img_columns = [rendered_mask, gt_mask, overlay]
-    print(f"Shape of rendered_mask: {rendered_mask.shape} gt mask {gt_mask.shape} and overlay {overlay.shape}")
     img_grid = torch.cat(img_columns, dim=1) # concatenate along width, shape [H, W*3, 1]
-
-    # save the image grid to disk using Image
     img_grid_np = (img_grid.squeeze(-1).detach().cpu().numpy() * 255).astype(np.uint8)
     img = Image.fromarray(img_grid_np)
     img.save(out_file)
