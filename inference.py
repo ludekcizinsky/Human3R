@@ -294,14 +294,13 @@ def save_output(outputs, outdir, revisit=1, subsample=1):
     pts3ds_self_ls = [output["pts3d_in_self_view"] for output in outputs["pred"]]
     pts3ds_self = torch.cat(pts3ds_self_ls, 0)
 
-
     # Recover camera poses.
     pr_poses = [
         pose_encoding_to_camera(pred["camera_pose"].clone()).cpu()
         for pred in outputs["pred"]
     ]
 
-   # reset_mask = torch.cat([view["reset"] for view in outputs["views"]], 0)
+    # reset_mask = torch.cat([view["reset"] for view in outputs["views"]], 0)
     if reset_mask.any():
         pr_poses = torch.cat(pr_poses, 0)
         identity = torch.eye(4, device=pr_poses.device)
@@ -313,11 +312,14 @@ def save_output(outputs, outdir, revisit=1, subsample=1):
         pr_poses = list(pr_poses.unsqueeze(1).unbind(0))
 
 
+    # Save camera parameters
+    # - Extrinsics
     R_c2w = torch.cat([pr_pose[:, :3, :3] for pr_pose in pr_poses], 0)
     t_c2w = torch.cat([pr_pose[:, :3, 3] for pr_pose in pr_poses], 0)
+    R_w2c = R_c2w.permute(0, 2, 1)
+    t_w2c = -torch.einsum("bij,bj->bi", R_w2c, t_c2w)
 
-
-    # Estimate focal length based on depth.
+    # - Intrinsics: estimate focal length based on depth.
     B, H, W, _ = pts3ds_self.shape
     pp = torch.tensor([W // 2, H // 2], device=pts3ds_self.device).float().repeat(B, 1)
     focal = estimate_focal_knowing_depth(pts3ds_self, pp, focal_mode="weiszfeld")
@@ -329,8 +331,20 @@ def save_output(outputs, outdir, revisit=1, subsample=1):
     intrinsics_tosave[:, 0, 2] = pp[:, 0]
     intrinsics_tosave[:, 1, 2] = pp[:, 1]
 
+    # - save to disk
+    cameras_to_save = {
+        "frame_idx": np.asarray(frame_indices, dtype=np.int32),
+        "R_world2cam": _to_numpy(R_w2c),
+        "t_world2cam": _to_numpy(t_w2c),
+        "K": _to_numpy(intrinsics_tosave),
+    }
 
-    colors_tosave = torch.cat(
+    cameras_path = os.path.join(outdir, "cameras.npz")
+    np.savez(cameras_path, **cameras_to_save)
+
+
+    # Parse rgb frames from outputs
+    rgb_frames = torch.cat(
         [
             0.5 * (output["img"].permute(0, 2, 3, 1) + 1.0)
             for output in outputs["views"]
@@ -338,7 +352,7 @@ def save_output(outputs, outdir, revisit=1, subsample=1):
     )  # [B, H, W, 3]
 
 
-    # get SMPL parameters from outputs
+    # Get SMPL parameters from outputs
     smpl_shape = [output.get(
         "smpl_shape", torch.empty(1,0,10))[0] for output in outputs["pred"]]
     smpl_rotvec = [roma.rotmat_to_rotvec(
@@ -352,8 +366,6 @@ def save_output(outputs, outdir, revisit=1, subsample=1):
         "smpl_id", torch.empty(1,0))[0] for output in outputs["pred"]]
 
         
-    per_person_state = {}
-
     # SMPL layer
     smpl_layer = SMPL_Layer(type='smplx', 
                             gender='neutral', 
@@ -363,57 +375,61 @@ def save_output(outputs, outdir, revisit=1, subsample=1):
     smpl_faces = smpl_layer.bm_x.faces
 
 
-    all_verts = []
+    # Save the per person and per frame smplx parameters
+    per_person_state = {}
     for f_id in range(B):
+
+        # Parse number of humans in the given frame
         n_humans_i = smpl_shape[f_id].shape[0]
-        pr_pose_mat = pr_poses[f_id].squeeze(0)
-        
-        if n_humans_i > 0:
-            with torch.no_grad():
-                smpl_out = smpl_layer(
-                    smpl_rotvec[f_id], 
-                    smpl_shape[f_id], 
-                    smpl_transl[f_id], 
-                    None, None, 
-                    K=intrinsics_tosave[f_id].expand(n_humans_i, -1 , -1), 
-                    expression=smpl_expression[f_id])
-        
 
-        color = colors_tosave[f_id].numpy()
-        intrins = intrinsics_tosave[f_id].numpy()
+        # TODO: need to figure out what this exactly does
+        with torch.no_grad():
+            smpl_out = smpl_layer(
+                smpl_rotvec[f_id], 
+                smpl_shape[f_id], 
+                smpl_transl[f_id], 
+                None, None, 
+                K=intrinsics_tosave[f_id].expand(n_humans_i, -1 , -1), 
+                expression=smpl_expression[f_id])
 
-        if n_humans_i > 0:
-            # transform smpl verts to world coordinates
-            all_verts.append(geotrf(pr_poses[f_id], smpl_out['smpl_v3d'].unsqueeze(0))[0])
-            pr_verts = [t.numpy() for t in smpl_out['smpl_v3d'].unbind(0)]
-            pr_faces = [smpl_faces] * n_humans_i
-            rotvec_cam = smpl_rotvec[f_id].detach().cpu().clone()
-            transl_cam = smpl_transl[f_id].detach().cpu()
-            transl_pelvis_cam = smpl_out["smpl_transl_pelvis"].detach().cpu()  # [n_h,1,3]
-            raw_person_ids = smpl_id[f_id]
-            if raw_person_ids is None:
-                person_ids = torch.arange(n_humans_i, dtype=torch.int32)
-            else:
-                person_ids = raw_person_ids if isinstance(
-                    raw_person_ids, torch.Tensor
-                ) else torch.tensor(raw_person_ids)
-                if isinstance(person_ids, torch.Tensor):
-                    if person_ids.numel() == 0:
-                        person_ids = torch.arange(n_humans_i, dtype=torch.int32)
-                    else:
-                        person_ids = person_ids.detach().cpu().to(torch.int32)
-        else:
-            pr_verts = []
-            pr_faces = []
-            all_verts.append(torch.empty(0))
-
+        # Visualisation inputs
+        # - Get the rgb image
+        color = rgb_frames[f_id].numpy()
         img_array_np = (color * 255).astype(np.uint8)
+
+        # - Get the intrinsic parameters for the current frame 
+        intrins = intrinsics_tosave[f_id].numpy()
         intrins_dict = {
             'focal': intrins[[0, 1], [0, 1]],
             'princpt': intrins[[0, 1], [-1, -1]],
         }
+
+        pr_verts = [t.numpy() for t in smpl_out['smpl_v3d'].unbind(0)]
+
+        # To be saved for later purposes
+        # - Get the rotation vectors and pelvis translation in camera coordinates 
+        rotvec_cam = smpl_rotvec[f_id].detach().cpu().clone()
+        transl_pelvis_cam = smpl_out["smpl_transl_pelvis"].detach().cpu()  # [n_h,1,3]
+
+        # Parse person IDs
+        raw_person_ids = smpl_id[f_id]
+        if raw_person_ids is None:
+            person_ids = torch.arange(n_humans_i, dtype=torch.int32)
+        else:
+            person_ids = raw_person_ids if isinstance(
+                raw_person_ids, torch.Tensor
+            ) else torch.tensor(raw_person_ids)
+            if isinstance(person_ids, torch.Tensor):
+                if person_ids.numel() == 0:
+                    person_ids = torch.arange(n_humans_i, dtype=torch.int32)
+                else:
+                    person_ids = person_ids.detach().cpu().to(torch.int32)
+
+
         for h_idx in range(n_humans_i):
             pid = int(person_ids[h_idx].item())
+
+            # Create directories for the current person if they don't exist
             if pid not in per_person_state:
                 person_root = os.path.join(outdir, f"{pid:02d}")
                 param_dir = os.path.join(person_root, "smplx_params")
@@ -427,15 +443,16 @@ def save_output(outputs, outdir, revisit=1, subsample=1):
                 }
             state = per_person_state[pid]
 
-            # Reorder to SMPL-X standard ordering (root, body, jaw, eyes, hands).
+            # Save the SMPLX parameters
+            # - Reorder to SMPL-X standard ordering (root, body, jaw, eyes, hands).
             rot_reordered = torch.zeros((55, 3), dtype=torch.float32)
             rot_reordered[0] = rotvec_cam[h_idx, 0]
             rot_reordered[1:22] = rotvec_cam[h_idx, 1:22]
             rot_reordered[22] = rotvec_cam[h_idx, 52]  # jaw
-            # eyes stay zero
             rot_reordered[25:40] = rotvec_cam[h_idx, 22:37]  # left hand
             rot_reordered[40:55] = rotvec_cam[h_idx, 37:52]  # right hand
 
+            # - Save to disk
             params = {
                 "betas": smpl_shape[f_id][h_idx].detach().cpu().numpy().tolist(),
                 "root_pose": rot_reordered[0].numpy().tolist(),
@@ -445,13 +462,13 @@ def save_output(outputs, outdir, revisit=1, subsample=1):
                 "reye_pose": [0.0, 0.0, 0.0],
                 "lhand_pose": rot_reordered[25:40].numpy().tolist(),
                 "rhand_pose": rot_reordered[40:55].numpy().tolist(),
-                # pelvis translation in camera coordinates to match legacy outputs
                 "trans": transl_pelvis_cam[h_idx, 0].numpy().tolist(),
             }
             json_path = os.path.join(state["param_dir"], f"{frame_indices[f_id]:05d}.json")
             with open(json_path, "w") as f:
                 json.dump(params, f)
 
+            # Render the SMPL mesh on the image for visualization
             smpl_rend_single = render_meshes(
                 img_array_np.copy(),
                 [pr_verts[h_idx]],
@@ -466,11 +483,16 @@ def save_output(outputs, outdir, revisit=1, subsample=1):
                 ],
                 1,
             )
+
+            # Update the frame counter for the current person
             frame_seq_idx = state["frame_counter"]
             state["frame_counter"] += 1
+
+            # Save the side-by-side visualization image
             frame_path = os.path.join(state["frame_dir"], f"{frame_seq_idx:06d}.png")
             iio.imwrite(frame_path, side_by_side)
 
+    # Create videos from the saved visualization frames
     ffmpeg_bin = shutil.which("ffmpeg") or "ffmpeg"
     output_fps = max(1, 20 // subsample)
     for pid, state in per_person_state.items():
@@ -503,19 +525,7 @@ def save_output(outputs, outdir, revisit=1, subsample=1):
         ]
         subprocess.run(ffmpeg_cmd, check=True)
         shutil.rmtree(frames_dir, ignore_errors=True)
-    R_w2c = R_c2w.permute(0, 2, 1)
-    t_w2c = -torch.einsum("bij,bj->bi", R_w2c, t_c2w)
-    cameras_to_save = {
-        "frame_idx": np.asarray(frame_indices, dtype=np.int32),
-        "R_world2cam": _to_numpy(R_w2c),
-        "t_world2cam": _to_numpy(t_w2c),
-        "K": _to_numpy(intrinsics_tosave),
-    }
-
-    cameras_path = os.path.join(outdir, "cameras.npz")
-    np.savez(cameras_path, **cameras_to_save)
-
-    return cameras_to_save
+    
 
 
 def run_inference(args):
