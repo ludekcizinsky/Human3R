@@ -5,7 +5,7 @@ source /home/cizinsky/miniconda3/etc/profile.d/conda.sh
 module load gcc ffmpeg
 
 # Configurations
-SCENE_NAME="hi4d_pair19_piggyback"
+SCENE_NAME=$1
 BASE_DIR="/scratch/izar/cizinsky/thesis/preprocessing/$SCENE_NAME/lhm"
 SEQ_PATH="$BASE_DIR/frames"
 MODEL_PATH="/scratch/izar/cizinsky/pretrained/human3r_896L.pth"
