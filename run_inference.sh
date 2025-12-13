@@ -2,6 +2,7 @@
 set -euo pipefail
 
 source /home/cizinsky/miniconda3/etc/profile.d/conda.sh
+conda activate human3r
 module load gcc ffmpeg
 
 # Configurations
@@ -16,8 +17,8 @@ SIZE=512
 SUBSAMPLE=1
 RESET_INTERVAL=100
 
-echo "-- Running initial reconstruction for scene: $SCENE_NAME"
-conda activate human3r
+
+cd submodules/human3r
 python inference.py \
     --model_path "$MODEL_PATH" \
     --size "$SIZE" \

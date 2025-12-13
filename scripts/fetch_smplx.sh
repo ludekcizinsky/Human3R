@@ -1,7 +1,7 @@
 #!/bin/bash
 urle () { [[ "${1}" ]] || return 1; local LANG=C i x; for (( i = 0; i < ${#1}; i++ )); do x="${1:i:1}"; [[ "${x}" == [a-zA-Z0-9.~-] ]] && echo -n "${x}" || printf '%%%02X' "'${x}"; done; echo; }
 
-# # SMPL-X model
+# SMPL-X model
 echo -e "\nYou need to register at https://smpl-x.is.tue.mpg.de"
 read -p "Username (SMPL-X):" username
 read -p "Password (SMPL-X):" password
@@ -34,5 +34,12 @@ rm -rf src/models/smpl/smpl.zip
 
 # Supplementary SMPL and SMPL-X files
 gdown --folder -O ./src/models/ https://drive.google.com/drive/folders/1JU7CuU2rKkwD7WWjvSZJKpQFFk_Z6NL7?usp=share_link
-mv src/models/J_regressor_h36m.npy src/models/smpl/J_regressor_h36m.npy
-mv src/models/smplx2smpl.pkl src/models/smplx/smplx2smpl.pkl
+mv src/models/body_models/J_regressor_h36m.npy src/models/smpl/J_regressor_h36m.npy
+mv src/models/body_models/smplx2smpl.pkl src/models/smplx/smplx2smpl.pkl
+mv src/models/body_models/smpl_mean_params.npz src/models/smpl_mean_params.npz
+mv src/models/body_models/smplx2smpl_joints.npy src/models/smplx2smpl_joints.npy
+
+# Cleanup
+rm src/models/smplx/smplx_npz.zip
+rm src/models/smplx/version.txt
+rm -rf src/models/body_models
