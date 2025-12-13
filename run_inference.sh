@@ -16,7 +16,7 @@ SIZE=512
 SUBSAMPLE=1
 RESET_INTERVAL=100
 
-echo "Running initial reconstruction for scene: $SCENE_NAME"
+echo "-- Running initial reconstruction for scene: $SCENE_NAME"
 conda activate human3r
 python inference.py \
     --model_path "$MODEL_PATH" \
