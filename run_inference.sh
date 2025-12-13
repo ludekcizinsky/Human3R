@@ -6,10 +6,10 @@ module load gcc ffmpeg
 
 # Configurations
 SCENE_NAME=$1
-BASE_DIR="/scratch/izar/cizinsky/thesis/preprocessing/$SCENE_NAME/lhm"
-SEQ_PATH="$BASE_DIR/frames"
-MODEL_PATH="/scratch/izar/cizinsky/pretrained/human3r_896L.pth"
-OUTPUT_DIR="$BASE_DIR/motion_human3r"
+BASE_DIR=/scratch/izar/cizinsky/thesis/results/$SCENE_NAME
+SEQ_PATH=$BASE_DIR/frames
+MODEL_PATH=/scratch/izar/cizinsky/pretrained/human3r_896L.pth
+OUTPUT_DIR=$BASE_DIR/motion_human3r
 mkdir -p "$OUTPUT_DIR"
 
 SIZE=512
